@@ -1,0 +1,2815 @@
+// Агент Базиса v2 — ЕДИНСТВЕННЫЙ файл, живущий внутри Базиса.
+//
+// Перезапуск агента — это ручные клики в Базисе, поэтому он написан так, чтобы
+// меняться почти никогда: по проводу едут ДАННЫЕ (список команд), а не код.
+// Вся изменчивость живёт в репозитории (src/bazis/emit.ts), агент остаётся
+// интерпретатором. Исполнения произвольного JS у него НЕТ: единственный способ
+// что-то изменить в модели — список команд, который агент умеет разобрать.
+//
+// Три правила хоста, нарушение которых стоит дорого:
+//   1. Action.Commit() обязателен: без него созданные объекты не видны в Model
+//      и не переживают вызов. Транзакцией владеет агент: одна задача = одна
+//      транзакция, любая ошибка ? Action.Revert(), а не половина кухни в модели.
+//   2. Двойное удаление роняет ПРОЦЕСС (try/catch не ловит — падает движок).
+//      Model.forEach рекурсивен и заходит внутрь блоков, поэтому удаление ходит
+//      ТОЛЬКО по верхнему уровню.
+//   3. NewHoleDrilling() и MakeFromHoles() роняют Базис — DrillHoles(p1,p2)
+//      зовётся напрямую.
+//
+// Файл — ES5 и без внешних зависимостей: он же грузится в тесты под vitest
+// (tests/bazis/agent.test.ts) поверх фейкового хоста.
+
+var PROTOCOL_VERSION = 8;
+
+/* -- Крепёж: его ставит СХЕМА ЦЕХА, а не мы -----------------------------------
+ *
+ * Присадку нельзя собирать из отверстий руками: у самодельной нулевой габарит,
+ * и при следующем открытии файла Базис перестраивает её по своему шаблону.
+ * Строить её из позиции базы крепежа мы тоже перестали: сколько крепежа нужно
+ * на стык и где именно -- правило ЦЕХА, а не наше, и записано оно схемой
+ * в его же Базисе.
+ *
+ * Поэтому агент возит СХЕМУ (команды scheme + mountScheme): строку, которую
+ * оператор захватил в диалоге выбора, и пару панелей. Дальше Базис считает
+ * раскладку сам -- ровно так же, как когда её ставит человек. Схем не дали --
+ * мебель приезжает без присадки, и ставит её оператор.
+ * -------------------------------------------------------------------------- */
+
+/* ?? Интерпретатор ?????????????????????????????????????????????????????????? */
+
+function emptyStats() {
+    return { panels: 0, schemes: 0, butts: 0, assemblies: 0, extrusions: 0, deleted: 0, commits: 0 };
+}
+
+/* -- Отчёт о времени сборки --------------------------------------------------
+ *
+ * Сборка идёт СИНХРОННО и держит поток, в котором Базис отзывается на мышь:
+ * пока идут команды, окно не перерисовывается вовсе, и «завис» снаружи
+ * неотличимо от «работает молча». Отличить их можно только следом в журнале,
+ * поэтому он пишется ПО ХОДУ, а не в конце: `appendFileSync` дописывает файл
+ * сразу, и след переживает даже снятие Базиса из диспетчера задач.
+ *
+ * Три вида записей и три разных вопроса:
+ *   удар пульса (раз в APPLY_BEAT_MS) -- «где мы сейчас»: строка оборвалась
+ *      на команде N -- значит завис именно N, а не сборка вообще;
+ *   медленная команда (дольше APPLY_SLOW_MS) -- «кто именно долгий»;
+ *   итог -- «куда ушло время»: по видам команд, худшая по времени и отдельной
+ *      строкой Commit, который у Базиса сам по себе не бесплатен.
+ * -------------------------------------------------------------------------- */
+
+/** Как часто сборка отмечается в журнале: реже -- грубее место зависания. */
+var APPLY_BEAT_MS = 2000;
+/** Команда дольше этого называется поимённо: одна такая объясняет всё. */
+var APPLY_SLOW_MS = 500;
+
+function profiler(host) {
+    var started = Date.now();
+    var beat = started;
+    var kinds = {};   // вид команды -> { n, ms, worst, at }
+    var order = [];   // порядок появления: у объекта его нет
+
+    function tell(level, msg) {
+        if (host && host.log) host.log(level, msg);
+    }
+    function sec(ms) { return (ms / 1000).toFixed(1); }
+
+    return {
+        /** Отметка «дошли до сюда»: ставится ДО команды, чтобы назвать зависшую. */
+        beat: function (i, n, kind) {
+            var now = Date.now();
+            if (now - beat < APPLY_BEAT_MS) return;
+            beat = now;
+            tell('INFO', 'apply: команда ' + i + ' из ' + n + ' (' + kind + '), прошло ' +
+                 sec(now - started) + ' с');
+        },
+        add: function (kind, ms, at) {
+            var k = kinds[kind];
+            if (!k) { k = kinds[kind] = { n: 0, ms: 0, worst: 0, at: 0 }; order.push(kind); }
+            k.n++;
+            k.ms += ms;
+            if (ms > k.worst) { k.worst = ms; k.at = at; }
+            if (ms >= APPLY_SLOW_MS) {
+                tell('WARN', 'apply: cmds[' + at + '] (' + kind + ') занял ' + sec(ms) + ' с');
+            }
+        },
+        report: function (jobId, n, ok) {
+            var total = Date.now() - started;
+            var by = order.slice().sort(function (a, b) { return kinds[b].ms - kinds[a].ms; });
+            var parts = [];
+            for (var i = 0; i < by.length; i++) {
+                var k = kinds[by[i]];
+                parts.push(by[i] + ' ' + k.n + ' -- ' + sec(k.ms) + ' с' +
+                           (k.worst >= APPLY_SLOW_MS ? ' (худшая ' + sec(k.worst) + ' с на cmds[' + k.at + '])' : ''));
+            }
+            tell(ok ? 'INFO' : 'ERROR', 'apply ' + jobId + ': ' + n + ' команд за ' + sec(total) + ' с' +
+                 (ok ? '' : ' и ОТКАТ') + (parts.length ? '; ' + parts.join('; ') : ''));
+        }
+    };
+}
+
+/**
+ * Ребро контура, крайнее вдоль названной мировой оси.
+ * Номер ребра в Базисе зависит от ориентации панели и нигде не задан, поэтому
+ * сторона называется направлением («z+»), а ребро ищется геометрически.
+ */
+function pickEdge(host, panel, side) {
+    var axis = side.charAt(0);
+    var sign = side.charAt(1);
+    var slot = axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
+    var edges = host.contourEdges(panel);
+    if (!edges || !edges.length) throw new Error('у панели нет контура');
+
+    var best = null, bestV = 0, spread = 0, minV = 0, maxV = 0;
+    for (var i = 0; i < edges.length; i++) {
+        var v = edges[i].mid[slot];
+        if (best === null) { best = edges[i]; bestV = v; minV = v; maxV = v; }
+        if (v < minV) minV = v;
+        if (v > maxV) maxV = v;
+        if (sign === '-' ? v < bestV : v > bestV) { best = edges[i]; bestV = v; }
+    }
+    spread = maxV - minV;
+    // Ось толщины: все середины рёбер лежат в одной плоскости, крайнего ребра нет.
+    if (spread === 0) throw new Error('сторона «' + side + '» не различает рёбра контура');
+    return best.i;
+}
+
+/**
+ * Выполнить задачу. Возвращает результат, наружу не бросает: половина кухни
+ * в модели хуже внятного кода возврата.
+ */
+function applyJob(job, host) {
+    var stats = emptyStats();
+
+    if (job.v !== PROTOCOL_VERSION) {
+        return {
+            v: PROTOCOL_VERSION, jobId: job.jobId, ok: false, duplicate: false,
+            error: 'версия протокола запроса ' + job.v + ', агент говорит на ' + PROTOCOL_VERSION +
+                   ' — перезапустите скрипт teril-agent в Базисе'
+        };
+    }
+
+    var prof = profiler(host);
+
+    // Идемпотентность: тот же jobId не собирает кухню дважды. Проверка идёт по
+    // модели, а не только по памяти агента, — тогда она переживает перезапуск.
+    // Мерится тоже: она читает свойство у КАЖДОГО объекта сцены и на чужой
+    // большой модели успевает подвесить окно ещё до первой команды.
+    var td = Date.now();
+    var already = jobAlreadyApplied(host, job.jobId);
+    prof.add('проверка дубля', Date.now() - td, -1);
+    if (already) {
+        return { v: PROTOCOL_VERSION, jobId: job.jobId, ok: true, duplicate: true, stats: stats };
+    }
+
+    var made = [];        // объекты в порядке создания — то, чем протокол ссылается
+    var topCreated = [];  // созданное на верхнем уровне: на него вешается метка задачи
+    var scopes = [];      // открытые блоки; покупной помнит своих детей до blockEnd
+    /*
+     * Группы, поставленные схемой. Держим их отдельным списком РАДИ ОТКАТА:
+     * объекты MountScheme попадают в модель сразу и Action.Revert() их
+     * не забирает -- "не звать Commit" тут не откат. Поэтому на ошибке
+     * их сносим руками, и только потом откатываем остальное.
+     */
+    var mounted = [];
+    var depth = 0;
+    var cmds = job.cmds || [];
+
+    host.begin();
+    try {
+        for (var i = 0; i < cmds.length; i++) {
+            var cmd = cmds[i];
+            prof.beat(i, cmds.length, cmd.c);
+            var t0 = Date.now();
+            try {
+                runCmd(cmd, host, made, topCreated, depth, stats, scopes, mounted);
+            } catch (e) {
+                throw new Error('cmds[' + i + '] (' + cmd.c + '): ' + (e && e.message ? e.message : e));
+            }
+            prof.add(cmd.c, Date.now() - t0, i);
+            if (cmd.c === 'blockBegin') depth++;
+            if (cmd.c === 'blockEnd') depth--;
+        }
+        if (depth !== 0) throw new Error('не закрыто блоков: ' + depth);
+
+        // Метка задачи и заказа — на объектах ВЕРХНЕГО уровня: по ним потом ищет
+        // deleteTop, который по устройству глубже не ходит.
+        var tp = Date.now();
+        for (var k = 0; k < topCreated.length; k++) {
+            host.prop(topCreated[k], 'jobId', job.jobId);
+            if (job.orderId) host.prop(topCreated[k], 'orderId', job.orderId);
+        }
+        prof.add('метка заказа', Date.now() - tp, -1);
+
+        // Commit меряется ОТДЕЛЬНО: он перестраивает и перерисовывает модель
+        // целиком, и на большой сцене стоит больше всех команд вместе взятых.
+        var tc = Date.now();
+        host.commit();
+        prof.add('commit', Date.now() - tc, -1);
+        stats.commits = 1;
+        prof.report(job.jobId, cmds.length, true);
+    } catch (err) {
+        // Отчёт пишется и здесь: неудачная сборка -- самая интересная,
+        // а откат у Базиса и сам по себе бывает долгим.
+        var tr = Date.now();
+        // Схемы -- ДО отката: откат их не заберёт, и остались бы они в модели
+        // крепежом без мебели. Своя ошибка здесь не должна отбирать откат
+        // у всего остального, поэтому каждая снимается отдельно.
+        for (var m = mounted.length - 1; m >= 0; m--) {
+            try { host.remove(mounted[m]); } catch (e2) {}
+        }
+        host.revert();
+        prof.add('revert', Date.now() - tr, -1);
+        prof.report(job.jobId, cmds.length, false);
+        return {
+            v: PROTOCOL_VERSION, jobId: job.jobId, ok: false, duplicate: false,
+            stats: stats, error: err && err.message ? err.message : String(err)
+        };
+    }
+
+    return { v: PROTOCOL_VERSION, jobId: job.jobId, ok: true, duplicate: false, stats: stats };
+}
+
+function runCmd(cmd, host, made, topCreated, depth, stats, scopes, mounted) {
+    var obj;
+    switch (cmd.c) {
+        case 'material':
+            host.material(cmd.name, cmd.t);
+            return;
+
+        case 'panel':
+            obj = host.panel(cmd.plane, cmd.a1, cmd.b1, cmd.a2, cmd.b2, cmd.pos, cmd.name);
+            made.push(obj);
+            born(obj, topCreated, depth, scopes);
+            stats.panels++;
+            return;
+
+        case 'butt':
+            var p = need(made, cmd.panel);
+            host.setButt(p, pickEdge(host, p, cmd.side), cmd.material, cmd.t, cmd.w, cmd.clip !== false);
+            stats.butts++;
+            return;
+
+        case 'scheme':
+            host.schemeDef(cmd.id, cmd.enc);
+            return;
+
+        case 'mountScheme':
+            // Крепёж внутри группы считает Базис, поэтому в stats идёт СТЫК,
+            // а не штуки: числа штук у нас нет и взяться ему неоткуда.
+            obj = host.mountScheme(cmd.scheme, need(made, cmd.panels[0]), need(made, cmd.panels[1]),
+                                   cmd.position, cmd.at);
+            // Ссылка нужна: на группу едет метка ведра, как на объёмы.
+            // Порядок push обязан совпасть с клиентским createsRef.
+            made.push(obj);
+            born(obj, topCreated, depth, scopes);
+            mounted.push(obj);
+            stats.schemes++;
+            return;
+
+        case 'blockBegin':
+            // ПОКУПНОЕ ИЗДЕЛИЕ — это Сборка, а не Блок: в "Расчёте стоимости"
+            // поштучно считается только TFurnAsm, содержимое TFurnBlock уходит
+            // в материалы и раскрой. BeginAssembly в API нет вовсе, поэтому
+            // объекты создаются рядом и переподчиняются в сборку на blockEnd
+            // (Owner = asm), пока она стоит в начале координат: мировые
+            // координаты детей от переподчинения не съезжают.
+            if (cmd.purchased) {
+                obj = host.assembly(cmd.name);
+                made.push(obj);
+                born(obj, topCreated, depth, scopes);
+                scopes.push({ obj: obj, kids: [] });
+                stats.assemblies++;
+            } else {
+                obj = host.blockBegin(cmd.name);
+                // Ссылка нужна и обычному блоку: на нём висят атрибуты узла
+                // спеки. Порядок push обязан совпасть с клиентским createsRef --
+                // ссылка это индекс создания, а не идентификатор.
+                made.push(obj);
+                born(obj, topCreated, depth, scopes);
+                scopes.push(null);
+            }
+            return;
+
+        case 'blockEnd':
+            if (!scopes.length) throw new Error('blockEnd без blockBegin');
+            var scope = scopes.pop();
+            if (scope) {
+                for (var c = 0; c < scope.kids.length; c++) host.adopt(scope.kids[c], scope.obj);
+            } else {
+                host.blockEnd();
+            }
+            return;
+
+        case 'assembly':
+            obj = host.assembly(cmd.name, cmd.at);
+            made.push(obj);
+            born(obj, topCreated, depth, scopes);
+            for (var a = 0; a < (cmd.adopt || []).length; a++) host.adopt(need(made, cmd.adopt[a]), obj);
+            stats.assemblies++;
+            return;
+
+        case 'extrude':
+            obj = host.extrude(cmd.name, cmd.contour.d, cmd.len, cmd.material, cmd.materialWidth,
+                               cmd.orientZ, cmd.orientY, cmd.at);
+            made.push(obj);
+            born(obj, topCreated, depth, scopes);
+            stats.extrusions++;
+            return;
+
+        case 'prop':
+            host.prop(need(made, cmd.ref), cmd.key, cmd.value);
+            return;
+
+        case 'deleteTop':
+            stats.deleted += deleteTop(host, cmd.match);
+            return;
+
+        default:
+            throw new Error('неизвестная команда');
+    }
+}
+
+/**
+ * Объект только что создан: пометить его для маркировки заказом и, если открыт
+ * ПОКУПНОЙ блок, запомнить как будущего ребёнка его сборки. У обычного блока
+ * запоминать нечего: BeginBlock подчиняет созданное сам.
+ */
+function born(obj, topCreated, depth, scopes) {
+    if (depth === 0) topCreated.push(obj);
+    var scope = scopes.length ? scopes[scopes.length - 1] : null;
+    if (scope) scope.kids.push(obj);
+}
+
+function need(made, ref) {
+    var o = made[ref];
+    if (o === undefined) throw new Error('ссылка на несозданный объект #' + ref);
+    return o;
+}
+
+/**
+ * Удаление ТОЛЬКО верхнего уровня. Дети блоков в список не попадают в принципе:
+ * DeleteObject(block) уносит их с собой, а повторное удаление ребёнка — краш движка.
+ */
+function deleteTop(host, match) {
+    var top = host.topObjects();
+    var doomed = [];
+    for (var i = 0; i < top.length; i++) {
+        if (matches(host, top[i], match)) doomed.push(top[i]);
+    }
+    for (var k = doomed.length - 1; k >= 0; k--) host.remove(doomed[k]);
+    return doomed.length;
+}
+
+function matches(host, obj, match) {
+    if (!match) return false;
+    if (match.name !== undefined && host.objName(obj) !== match.name) return false;
+    if (match.prop !== undefined && String(host.objProp(obj, match.prop.key)) !== String(match.prop.value)) return false;
+    return match.name !== undefined || match.prop !== undefined;
+}
+
+function jobAlreadyApplied(host, jobId) {
+    var top = host.topObjects();
+    for (var i = 0; i < top.length; i++) {
+        if (String(host.objProp(top[i], 'jobId')) === String(jobId)) return true;
+    }
+    return false;
+}
+
+// Проверки «есть ли такой материал в базе» здесь НЕТ намеренно. Она была и врала:
+// ActiveMaterial.Make() молча заводит материал, если такого имени нет, и чтение
+// имени обратно подтверждает выдуманное имя ровно так же, как настоящее.
+// Список имён ведётся в репозитории (src/bazis/naming.ts), базу материалов — человек.
+
+/** Единая точка входа: метод ? ответ. Транспорт снаружи. */
+function handle(job, host) {
+    if (job.method === 'ping') {
+        return { v: PROTOCOL_VERSION, jobId: job.jobId, ok: true, duplicate: false,
+                 data: { protocol: PROTOCOL_VERSION, api: host.apiVersion() } };
+    }
+    if (job.method === 'model') {
+        return { v: PROTOCOL_VERSION, jobId: job.jobId, ok: true, duplicate: false, data: host.serialize() };
+    }
+    if (job.method === 'apply') {
+        return applyJob(job, host);
+    }
+    // Строка разговора с проектировщиком. Едет тем же каналом, что и сборка:
+    // у скрипта один цикл опроса, один адрес и одна авторизация. Модель Базиса
+    // при этом не трогается вовсе -- команд у такой задачи нет.
+    if (job.method === 'ui') {
+        if (host.ui) host.ui(job.text || '', job.kind || 'log');
+        return { v: PROTOCOL_VERSION, jobId: job.jobId, ok: true, duplicate: false };
+    }
+    return { v: PROTOCOL_VERSION, jobId: job.jobId, ok: false, duplicate: false,
+             error: 'неизвестный метод: ' + job.method };
+}
+
+/* ?? Хост: тонкие обёртки над глобалями Базиса ?????????????????????????????? */
+//
+// Обёртки, а не проброс самих функций: нативные методы движка чувствительны к
+// тому, на чём их зовут, поэтому вызовы остаются глобальными.
+
+function bazisHost() {
+    return {
+        apiVersion: function () {
+            try { return system.apiVersion; } catch (e) { return 0; }
+        },
+
+        begin: function () { Action.Continue(); },
+        commit: function () { Action.Commit(); },
+        revert: function () { Action.Revert(); },
+
+        material: function (name, t) { ActiveMaterial.Make(name, t); },
+
+        panel: function (plane, a1, b1, a2, b2, pos, name) {
+            var p = plane === 'vert' ? AddVertPanel(a1, b1, a2, b2, pos)
+                  : plane === 'horiz' ? AddHorizPanel(a1, b1, a2, b2, pos)
+                  : AddFrontPanel(a1, b1, a2, b2, pos);
+            p.Name = name;
+            return p;
+        },
+
+        // Мировые середины рёбер контура: контур лежит в локальной плоскости
+        // панели (z = 0..Thickness), поэтому середину поднимаем на полтолщины.
+        contourEdges: function (p) {
+            var out = [], n = p.Contour.Count;
+            for (var i = 0; i < n; i++) {
+                var L = p.Contour.Objects[i].AsLine();
+                var mx = (L.Pos1.x + L.Pos2.x) / 2, my = (L.Pos1.y + L.Pos2.y) / 2;
+                var M = p.ToGlobal(NewVector(mx, my, p.Thickness / 2));
+                out.push({ i: i, mid: [M.x, M.y, M.z] });
+            }
+            return out;
+        },
+
+        // Butts.Add(), а не AddButt: последний требует объект материала, который
+        // без UI с конкретным именем не задать.
+        setButt: function (panel, elem, material, t, w, clip) {
+            var b = panel.Butts.Add();
+            b.ElemIndex = elem;
+            b.Material = material;
+            b.Thickness = t;
+            b.Width = w;
+            b.ClipPanel = clip;
+            return b;
+        },
+
+        schemes: {},
+        /*
+         * Схема, приехавшая строкой, разбирается ОДИН раз на задачу и живёт
+         * в этом значении: `DecodeFromString` на каждый стык стоил бы полсотни
+         * разборов чужого формата на кухню.
+         *
+         * Значение берётся у страницы свойств, и только у неё: у объекта
+         * из `OpenFurniture()` MountScheme возвращает undefined и оставляет
+         * в модели бестелесную «линию стыка». DatumMode после разбора обязан
+         * стать 7 (Scheme) -- иначе в строке не схема, и молчать об этом нельзя.
+         */
+        schemeDef: function (id, enc) {
+            var v = Action.Properties.NewFurnitureValue();
+            v.DecodeFromString(enc);
+            if (v.DatumMode !== 7) {
+                throw new Error('строка схемы «' + id + '» разобралась не в схему (DatumMode ' +
+                                v.DatumMode + ') -- выберите схему заново в настройках места');
+            }
+            this.schemes[id] = v;
+        },
+
+        /*
+         * СТЫК, ПОСТАВЛЕННЫЙ СХЕМОЙ ЦЕХА: раскладку по стыку считает сам Базис
+         * -- ровно так, как это делает оператор руками. Пустой результат --
+         * ошибка, а не пустая работа: молча не поставить крепёж хуже, чем упасть.
+         */
+        mountScheme: function (id, p1, p2, position, at) {
+            var v = this.schemes[id];
+            if (!v) throw new Error('схема «' + id + '» не приехала перед стыком');
+            var grp = v.MountScheme(p1, p2, position, NewVector(at[0], at[1], at[2]));
+            if (!grp) throw new Error('схема не встала: MountScheme вернул пусто');
+            return grp;
+        },
+
+        blockBegin: function (name) { return BeginBlock(name); },
+        blockEnd: function () { EndBlock(); },
+
+        assembly: function (name, at) {
+            var a = AddAssembly(name);
+            if (at) a.Translate(NewVector(at[0], at[1], at[2]));
+            return a;
+        },
+        adopt: function (child, parent) { child.Owner = parent; },
+
+        extrude: function (name, d, len, material, materialWidth, oz, oy, at) {
+            ActiveMaterial.Make(material, materialWidth || d);
+            var e = AddExtrusion(name);
+            // Сечение задаётся СРАЗУ, до контура: иначе погонный учёт не включится,
+            // а на закоммиченной экструзии его уже не поменять.
+            if (materialWidth) e.MaterialWidth = materialWidth;
+            e.MaterialName = material;
+            e.Contour.AddCircle(0, 0, d / 2);
+            e.Orient(NewVector(oz[0], oz[1], oz[2]), NewVector(oy[0], oy[1], oy[2]));
+            e.Thickness = len;
+            e.Translate(NewVector(at[0], at[1], at[2]));
+            try { e.Build(); } catch (err) {} // без явной перестройки тело иногда вырождается
+            return e;
+        },
+
+        prop: function (obj, key, value) { obj.UserProperty[key] = value; },
+
+        topObjects: function () {
+            var list = (typeof Model.AsList === 'function') ? Model.AsList() : Model;
+            var out = [];
+            for (var i = 0; i < list.Count; i++) out.push(list.Objects[i]);
+            return out;
+        },
+        objName: function (obj) { try { return obj.Name; } catch (e) { return null; } },
+        objProp: function (obj, key) { try { return obj.UserProperty[key]; } catch (e) { return undefined; } },
+        remove: function (obj) { DeleteObject(obj); },
+
+        serialize: function () { return serializeModel(); }
+    };
+}
+
+/**
+ * Дамп модели для обратного чтения. Отдаёт ровно то, из чего src/bazis/read.ts
+ * собирает список панелей: мировой габарит, материал, толщину, маркировку и
+ * кромки с мировой серединой их ребра (номер ребра сам по себе ничего не значит).
+ */
+function serializeModel() {
+    var list = (typeof Model.AsList === 'function') ? Model.AsList() : Model;
+    var out = [];
+    for (var i = 0; i < list.Count; i++) collect(list.Objects[i], out, 0, null);
+    return { objects: out };
+}
+
+/** Десятые доли миллиметра: присадка стоит на целых, а чашка узкой рамы -- на половине. */
+function r1(v) { return Math.round(v * 10) / 10; }
+
+function collect(obj, out, depth, parent) {
+    if (!obj || depth > 8) return;
+    // Дамп ПЛОСКИЙ: дети идут в тот же массив следом за родителем, и связи
+    // между ними в записи нет. Без depth/parent не отличить объект верхнего
+    // уровня от вложенного, а блок узла -- от его же панелей.
+    var rec = { name: null, type: 'unknown', props: {}, depth: depth,
+                parent: parent === undefined ? null : parent };
+    try { rec.name = obj.Name; } catch (e) {}
+    try { rec.uid = obj.UID; } catch (e) {}
+    try {
+        var n = obj.UserPropCount;
+        for (var u = 0; u < n; u++) rec.props[obj.UserPropertyName[u]] = obj.UserProperty[u];
+    } catch (e) {}
+    try {
+        var mn = obj.GabMin, mx = obj.GabMax;
+        if (mn && mx && mn.x !== undefined) {
+            rec.min = [Math.round(mn.x), Math.round(mn.y), Math.round(mn.z)];
+            rec.max = [Math.round(mx.x), Math.round(mx.y), Math.round(mx.z)];
+        }
+    } catch (e) {}
+
+    // Присадка: единственный объект, у которого есть отверстия. Панель их
+    // не отдаёт вовсе -- Panel3D.Holes не существует, а panel.Cuts пуст даже
+    // после DrillHoles. Координаты мировые (ObjectToGlobal для точки,
+    // NObjectToGlobal для направления -- оно без сдвига): матрицу присадки
+    // на чтение не отдаёт ни одно свойство, и восстановить её иначе нельзя.
+    try {
+        if (obj.Holes && obj.Holes.Count) {
+            rec.type = 'fastener';
+            rec.holes = [];
+            for (var hi = 0; hi < obj.Holes.Count; hi++) {
+                var h = obj.Holes[hi];
+                var hp = obj.ObjectToGlobal(h.Position);
+                var hd = obj.NObjectToGlobal(h.Direction);
+                rec.holes.push({ d: h.Diameter, depth: h.Depth,
+                                 at: [r1(hp.x), r1(hp.y), r1(hp.z)],
+                                 dir: [r1(hd.x), r1(hd.y), r1(hd.z)] });
+            }
+            out.push(rec);
+            return;
+        }
+    } catch (e) {}
+
+    if (obj.List) {
+        rec.type = 'group';
+        out.push(rec);
+        var l = obj.AsList();
+        for (var c = 0; c < l.Count; c++) collect(l.Objects[c], out, depth + 1, rec.uid === undefined ? null : rec.uid);
+        return;
+    }
+
+    try {
+        var p = obj.AsPanel;
+        if (p && p.ContourWidth !== undefined) {
+            rec.type = 'panel';
+            rec.t = p.Thickness;
+            rec.material = p.MaterialName;
+            rec.butts = [];
+            var cnt = p.Butts.Count, arr = p.Butts.Butts;
+            for (var b = 0; b < cnt; b++) {
+                var e = arr[b];
+                rec.butts.push({ elem: e.ElemIndex, material: e.Material, t: e.Thickness, w: e.Width, mid: edgeMid(p, e.ElemIndex) });
+            }
+        }
+    } catch (e) {}
+
+    out.push(rec);
+}
+
+function edgeMid(p, elem) {
+    try {
+        var L = p.Contour.Objects[elem].AsLine();
+        var mx = (L.Pos1.x + L.Pos2.x) / 2, my = (L.Pos1.y + L.Pos2.y) / 2;
+        var M = p.ToGlobal(NewVector(mx, my, p.Thickness / 2));
+        return [Math.round(M.x), Math.round(M.y), Math.round(M.z)];
+    } catch (e) {
+        return null;
+    }
+}
+
+/* ?? Транспорт: только исходящие соединения ????????????????????????????????? */
+//
+// Слушающий сокет в процессе Базиса заводить нельзя: скрипт останавливают по Esc,
+// и освобождение порта закладывать не на что — поймаем «port in use» с перезапуском
+// самого Базиса. Поэтому агент сам опрашивает релей.
+
+/** Куда класть настройки и лог на машине с Базисом. */
+var AGENT_DIR = 'C:/ProgramData/Teril';
+var CONFIG_FILE = AGENT_DIR + '/server.json';
+/**
+ * ПОСЛЕДНИЙ запас для нового файла, а не место для него. Папка СКРЫТАЯ, и
+ * положенный в неё файл человек не найдёт проводником вовсе -- у него будет
+ * только путь строкой в форме. Поэтому сюда кладётся лишь то, что не легло
+ * никуда лучше: место называет сам человек диалогом, а не мы за него
+ * (см. `chooseTarget` в startAgent).
+ */
+var AGENT_FILE = AGENT_DIR + '/teril-agent.js';
+/** Откуда качается новый скрипт. Токена не спрашивает: файл открыт всем. */
+var AGENT_PATH = '/download/teril-agent.js';
+/**
+ * Что показывает диалог, когда спрашивает, какой файл заменить. Только
+ * скрипты: диалог отдаёт любой файл, на который покажут, а наш текст поверх
+ * чужой модели -- потеря работы, а не промах в удобстве.
+ */
+var AGENT_MASK = 'js';
+var LOG_FILE = AGENT_DIR + '/agent.log';
+var LOG_MAX = 200 * 1024;
+
+/* -- Зашитые настройки: их штампует раздача, а не рука -----------------------
+ *
+ * Проектировщику отдаётся ОДИН файл и больше ничего: он не заводит файла
+ * настроек, не открывает C:/ProgramData и не переписывает токен -- а значит
+ * и не путает его.
+ *
+ * В репозитории строки пустые, и это не заготовка, а правило: токен рабочего
+ * места в git не едет.
+ *
+ * АДРЕС вписывает сайт, когда отдаёт файл (src/web/http.ts, `sendAgent`):
+ * скрипт качается свободно, один на всех, и адрес сервера в нём -- не секрет.
+ * А ТОКЕН сайт не вписывает никогда: пересланный коллеге файл отдавал бы чужую
+ * подписку. Токен спрашивается при первом запуске полем формы чата
+ * (`chatForm`, `askToken`) и ложится в CONFIG_FILE рядом с журналом.
+ */
+var BAKED_URL = "https://teril.ru";
+var BAKED_TOKEN = '';
+
+/**
+ * Настройки. Порядок: явный аргумент ? зашитое ? файл настроек ? окружение
+ * (Базис его обычно не пробрасывает) ? localhost.
+ *
+ * Зашитое стоит ВЫШЕ файла нарочно. Файл остаётся на машине от прежних
+ * испытаний, и старый токен в нём перебивал бы тот, ради которого копию
+ * и делали: 401 вместо работы, а искать причину пришлось бы в чужом
+ * C:/ProgramData, куда никто не смотрит.
+ */
+function agentConfig(config, fs) {
+    var file = {};
+    try { file = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e) {}
+    var env = {};
+    try { env = process.env || {}; } catch (e) {}
+    return {
+        url: (config && config.url) || BAKED_URL || file.url || env.SERVER_URL || 'http://127.0.0.1:8787',
+        token: (config && config.token) || BAKED_TOKEN || file.token || env.SERVER_TOKEN || 'CHANGE_ME',
+        // Форма чата. Выключают её там, где рабочее место обслуживает терминал:
+        // тогда скрипт остаётся чистым агентом и ничего не показывает.
+        ui: file.ui !== false && !(config && config.ui === false),
+        // Консоль Базиса -- окно приложения, и в охоте на зависания окна она
+        // подозреваемая, а не свидетель: журнал на диске самодостаточен.
+        console: file.console === true || !!(config && config.console === true),
+        // След шагов внутри задачи. Пока зависания не поняты -- по умолчанию ДА.
+        trace: file.trace !== false && !(config && config.trace === false),
+        source: (config && config.url) ? 'аргумент' : BAKED_URL ? 'зашито в файл' : file.url ? CONFIG_FILE : env.SERVER_URL ? 'окружение' : 'умолчание'
+    };
+}
+
+/** Токен, с которым работать нельзя: его надо спросить у человека. */
+function noToken(token) {
+    return !token || token === 'CHANGE_ME';
+}
+
+/**
+ * ЧТО НЕ ТАК С ВВЕДЁННЫМ ТОКЕНОМ -- сказанное до первого запроса. Пусто
+ * значит «похоже на токен, пробуем».
+ *
+ * Проверка стоит здесь, а не в ответе сервера, из-за одной ошибки, которую
+ * делают все. В кабинете, в таблице мест, токена НЕТ: там виден его хвост
+ * (`…abcd`) -- чтобы узнать место, а не чтобы войти. Хвост этот стоит
+ * в столбце «Токен», человек его копирует, вставляет в форму -- и получает
+ * от сервера 401, то есть «токен не признан» на то, что токеном и не было.
+ * Разбор 2026-09-10 (место 192) кончился именно этим: семь знаков в поле
+ * и десять минут ожидания.
+ *
+ * Поэтому обрывок отбивается ЗДЕСЬ и словами про хвост: сервер на такой вопрос
+ * отвечает одинаково и коротко, а сказать надо не «не признан», а «вы взяли
+ * не то место в кабинете».
+ *
+ * Строгой проверки вида тут нет нарочно: токен места выдаёт кабинет
+ * (`bz_` и 43 знака), но служебное место стенда живёт в окружении и выглядит
+ * как угодно. Ловится поэтому только заведомо невозможное -- обрывок, пробел
+ * внутри, многоточие кабинета.
+ */
+function tokenComplaint(token) {
+    var t = String(token === undefined ? '' : token);
+    var TAIL = 'В кабинете, в таблице мест, виден только ХВОСТ токена -- последние знаки, ' +
+        'по которым место узнают. Войти им нельзя. Сам токен показывается ОДИН раз, ' +
+        'при выдаче: нажмите в кабинете «Новый токен» и вставьте то, что он покажет -- ' +
+        'он длинный и начинается с bz_.';
+    if (/[\u2026]|\.\.\./.test(t)) return 'Это хвост токена, а не токен: многоточие кабинет ставит сам. ' + TAIL;
+    if (/\s/.test(t)) return 'В токене не бывает пробелов -- похоже, скопировалась строка целиком, а не токен. ' + TAIL;
+    if (t.length < 16) return 'Это слишком короткий обрывок (' + t.length + ' знаков), токеном он быть не может. ' + TAIL;
+    return '';
+}
+
+/**
+ * Дописать настройки в CONFIG_FILE, не потеряв чужих полей.
+ *
+ * Читаем-правим-пишем, а не пишем целиком: в файле у проектировщика могут
+ * лежать `console` и `trace`, поставленные при разборе зависания, и стереть
+ * их вводом токена значило бы молча выключить журнал, которым лечились.
+ */
+function saveConfig(fs, patch) {
+    var file = {};
+    try { file = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e) {}
+    for (var k in patch) { if (Object.prototype.hasOwnProperty.call(patch, k)) file[k] = patch[k]; }
+    try { fs.mkdirSync(AGENT_DIR); } catch (e) {}
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(file, null, 2));
+}
+
+/**
+ * Забыть токен: выход из учётной записи.
+ *
+ * Стирается ОН ОДИН, а не файл целиком: адрес сервера, `console` и `trace`
+ * лежат там же и к учётной записи отношения не имеют -- снести их выходом
+ * значило бы выключить журнал, которым лечились, и потерять адрес, который
+ * вписал сайт.
+ *
+ * Зашитый в файл токен (`BAKED_TOKEN`) этим не снимается: он старше файла
+ * настроек (см. agentConfig). Сайт токена не зашивает никогда, поэтому в жизни
+ * такой копии нет; появись она -- выход в ней кончится тем же токеном.
+ */
+function forgetToken(fs) {
+    var file = {};
+    try { file = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e) {}
+    delete file.token;
+    try { fs.mkdirSync(AGENT_DIR); } catch (e) {}
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(file, null, 2));
+}
+
+/* -- Раскладка форм: числа вместо выравнивания -----------------------------
+ *
+ * Ни одно свойство обеих форм НЕ ВЫРАВНИВАЕТСЯ (`AlignType.None`): каждому
+ * прописаны левый край, верх, ширина и высота.
+ *
+ * Так сделано ради скорости открытия. Выравнивание в Delphi -- это цепочка:
+ * каждое добавленное свойство заставляет родителя разложить ЗАНОВО все
+ * прежние, то есть два с половиной десятка строк разговора стоят порядка
+ * трёх сотен перекладок, и все они -- в том самом потоке, в котором Базис
+ * отзывается на мышь. Отсюда и «форма долго открывается». Числа не считаются
+ * вовсе: свойство встаёт туда, где его положили.
+ *
+ * Второе, что от этого выигрывается, -- ПОРЯДОК. Выровненные по верху
+ * свойства группа Базиса выкладывала снизу вверх, и всё в форме заводилось
+ * задом наперёд. Теперь порядок создания и видимый порядок -- один и тот же.
+ *
+ * Цена -- размер окна фиксирован (он и был фиксирован, см. chatForm),
+ * и всё в форме считается из его чисел, чтобы пустого места по краям
+ * не оставалось.
+ *
+ * ГРУПП В ФОРМАХ НЕТ ВОВСЕ. Заголовок группы Базис не показывает, а рамка
+ * съедала по краям десяток-другой точек с каждой стороны и весь низ окна;
+ * при числовой раскладке группа не даёт вообще ничего -- она нужна была
+ * выравниванию, которого больше нет. Осталась ОДНА группа, и ровно за тем,
+ * чего сама форма не умеет: окно разговора прокручивается (`Scrollable`),
+ * а полоса прокрутки бывает только у группы.
+ */
+
+/** Размеры окна. Из них считается вся раскладка -- пустого места не остаётся. */
+var FORM_W = 560;
+var FORM_H = 680;
+/** Отступ от края окна. */
+var PAD = 6;
+/**
+ * Высота строки РАЗГОВОРА. Строки стоят вплотную, как в терминале: их много,
+ * и воздух между ними -- это потерянные строки.
+ */
+var ROW_H = 18;
+/**
+ * Высота свойства, с которым РАБОТАЮТ РУКАМИ. Больше строки разговора нарочно:
+ * поле ввода рисует рамку, и в 18 точках её нижний край срезался соседом снизу.
+ */
+var FIELD_H = 22;
+/** Воздух между свойствами, с которыми работают руками. */
+var GAP = 8;
+/** Ширина свойства на форме: окно минус отступы и рамка. */
+var FORM_INNER_W = FORM_W - 2 * PAD - 8;
+
+/** Положить свойство числами и снять с него выравнивание. */
+function place(prop, left, top, width, height) {
+    prop.Align = AlignType.None;
+    prop.SetLayout(left, top, width, height);
+    return prop;
+}
+
+
+/* -- Форма чата ------------------------------------------------------------
+ *
+ * ФОРМА В СКРИПТЕ ОДНА, и вход живёт в ней же. Отдельная форма входа поверх
+ * чата всплывала не всегда: Базис поднимает её без владельца, и щелчок мимо
+ * уводил её ЗА окно чата -- поле, в которое надо ввести токен, оказывалось
+ * невидимым, а чат под ним ничего не принимал. Поэтому токен спрашивается
+ * НА МЕСТЕ ПРОСЬБЫ: поле «Токен» и адрес кабинета встают туда же, где стоят
+ * «Что сделать» и галка, ровно как встаёт на это место кнопка остановки
+ * (см. `mode` ниже). Прятать и показывать -- один `Visible`: раскладка
+ * числовая, двигать нечего.
+ *
+ * Проектировщик не пишет заказ и не открывает терминал: он просит словами
+ * и смотрит, что ответили. Поэтому форма живёт В ТОМ ЖЕ скрипте, что и цикл
+ * задач: два скрипта Базис одновременно не крутит, а витку на сервере нужен
+ * живой агент -- он читает модель и собирает изменившиеся узлы.
+ *
+ * Отсюда же конец сессии: Esc останавливает скрипт, и сервер узнаёт об этом
+ * по молчанию. Крестик формы делает то же самое явно -- прощается с сервером
+ * и ЗАКАНЧИВАЕТ команду (`Action.Finish`): без формы ассистента нет, а цикл
+ * опроса, оставшись жить, держал бы Базис занятым неизвестно чем. Следующий
+ * запуск начинает с чтения модели, а не с того, что запомнил прошлый.
+ *
+ * ЧИСЛО СТРОК В ФОРМЕ НЕ МЕНЯЕТСЯ ВОВСЕ, и это не бережливость, а лечение
+ * зависаний. Свойства были выложены Align = Top в Scrollable-группе: пока
+ * строк меньше, чем влезает, всё хорошо, а на первой строке сверх высоты
+ * появлялась полоса прокрутки, она отнимала ширину, раскладка считалась
+ * заново -- и Базис вставал намертво (замеры 2026-08-22: оба раза поток умирал
+ * СРАЗУ ПОСЛЕ того, как строки добавились, ни одной задачи после этого
+ * в журнал не попало).
+ *
+ * Поэтому строки СОЗДАЮТСЯ ОДИН РАЗ при открытии формы, а разговор в них
+ * переписывается, как в терминале: `Value` вместо `NewString`.
+ *
+ * ПРОКРУТКА при этом ВЕРНУЛАСЬ, и вернулась безопасно: строк заводится больше,
+ * чем видно в окне (CHAT_POOL), поэтому полоса прокрутки стоит с самого начала
+ * и НЕ ПОЯВЛЯЕТСЯ на ходу -- а появление её и было бедой. Перекладывать нечего
+ * и тогда: выравнивания в форме нет (см. place выше), свойства стоят числами.
+ * Видно всегда САМОЕ НОВОЕ -- оно вверху окна, -- а прокруткой вниз достаётся
+ * то, что уехало за край. Дальше пула история не теряется тоже:
+ * `host.ui` пишет КАЖДОЕ событие целиком в agent.log.
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Высота просьбы. Строк здесь ЧЕТЫРЕ: поле, галка с выходом, картинки
+ * и настройки места. Кнопка остановки места отдельно не занимает -- она
+ * встаёт НА МЕСТО поля на время хода (см. chatForm, `busy`), и одновременно
+ * они не видны никогда.
+ *
+ * Четвёртая строка стоит одной строки разговора, и платится она за то, что
+ * иначе не настроить ВООБЩЕ: материал и схему присадки выбирает диалог самого
+ * Базиса, а он есть только здесь (см. placeForm).
+ */
+var ASK_VIEW_H = 4 * FIELD_H + 3 * GAP;
+/** Верх окна разговора: под просьбой, с воздухом. */
+var CHAT_TOP = PAD + ASK_VIEW_H + GAP;
+/**
+ * Высота окна разговора: ВСЁ, что осталось от окна под просьбой. Клиентская
+ * область формы меряется от её высоты за вычетом заголовка и рамок (26) --
+ * числа этого Базис не отдаёт, поэтому оно замерено по снимку окна. Ошибиться
+ * здесь не страшно в обе стороны: промахнулись вниз -- остаётся полоска
+ * пустого места, промахнулись вверх -- нижние строки уезжают под полосу
+ * прокрутки, которая тут и так есть.
+ */
+var CHAT_VIEW_H = Math.floor((FORM_H - 26 - CHAT_TOP - PAD) / ROW_H) * ROW_H;
+/** Строк ВИДНО в окне разговора. */
+var CHAT_ROWS = Math.floor(CHAT_VIEW_H / ROW_H);
+/**
+ * Во сколько раз строк ЗАВОДИТСЯ больше, чем видно: остальное достаётся
+ * прокруткой. Единица убирает прокрутку вовсе -- окно тогда ровно в свой
+ * размер. Больше двух ставить незачем: каждая строка -- свойство формы,
+ * а их и создавать, и переписывать на каждом сообщении.
+ */
+var CHAT_SCROLL_X = 2;
+/** Строк ЗАВОДИТСЯ: создаются один раз, дальше только переписываются. */
+var CHAT_POOL = CHAT_ROWS * CHAT_SCROLL_X;
+/**
+ * Ширина строки разговора В ТОЧКАХ: свойство группы минус полоса прокрутки
+ * (её ставит `place` ниже) и минус рамка самого редактора, который рисует
+ * строку.
+ */
+var CHAT_ROW_W = FORM_INNER_W - 28 - 8;
+/**
+ * Сколько точек занимает ОДИН ЗНАК В ХУДШЕМ СЛУЧАЕ. Шрифт у свойства формы
+ * пропорциональный, ширины строки Базис не меряет и не отдаёт, а обрезанную
+ * строку человек видит не как «шрифт шире, чем мы думали», а как пропавший
+ * конец сообщения. Поэтому считаем по самым широким знакам («ш», «м», прописные
+ * и цифры), а не по средним: узкая строка теряет немного места справа, широкая
+ * теряет текст.
+ */
+var CHAT_CHAR_W = 8;
+/**
+ * Где резать длинную строку: переноса у свойства нет вовсе. Число СЧИТАЕТСЯ
+ * из ширины окна, а не подбирается на глаз, -- подобранное на глаз (96 знаков
+ * при 512 точках, то есть 5.3 точки на знак) не помещалось в строку и молча
+ * обрезалось.
+ *
+ * Два знака вычитаются НА ПОМЕТКУ: каждая напечатанная строка начинается
+ * с «> », «! », «* » или двух пробелов отступа (см. `append`), и в перенос
+ * они не входили вовсе -- рисовалось на два знака больше, чем резалось.
+ */
+var CHAT_WRAP = Math.floor(CHAT_ROW_W / CHAT_CHAR_W) - 2;
+/**
+ * Сколько строк отчёта показываем: остальное целиком лежит в agent.log.
+ * Меряется от окна -- отчёт обязан помещаться в него целиком, вместе
+ * с просьбой, которая его вызвала, и парой строк прежнего разговора.
+ */
+var CHAT_BLOCK = CHAT_ROWS - 6;
+/**
+ * Через сколько замок открывается сам, не дождавшись конца хода.
+ *
+ * Это не срок хода -- его держит сервер, -- а СТОРОЖ ПРОТИВ МОЛЧАНИЯ: конец
+ * хода приезжает событием `done`, и если сервер умер посреди хода (или задачу
+ * с событием некому было забрать), форма считала бы ход вечным и не отправила
+ * бы больше ни одной просьбы. Срок нарочно много больше самого долгого хода:
+ * открыть замок рано хуже, чем поздно, -- вторая просьба уйдёт в занятый
+ * сервер и вернётся отказом.
+ */
+var TURN_WATCHDOG_MS = 15 * 60000;
+
+/**
+ * Через сколько ход, не сказавший НИ СЛОВА, считается несостоявшимся.
+ *
+ * Это другой сторож, и стоит он против другой беды. Пятнадцать минут -- срок
+ * для хода, который ИДЁТ и вдруг замолчал; ход же, который не начался вовсе
+ * (задачу с событием некому забрать, цикл опроса погашен, сервер принял
+ * просьбу и умер), молчит с первой секунды -- и держать на нём человека
+ * четверть часа не за чем. Первое слово сервер говорит СРАЗУ: просьбу он
+ * повторяет в разговор тем же запросом, которым её принял, и приезжает она
+ * ближайшим опросом, то есть за секунду.
+ *
+ * Поэтому замок держится полторы минуты, а потом открывается со словами о том,
+ * что случилось. Запас против медленной сети тут стократный, а цена ошибки --
+ * одна лишняя просьба, которую занятый сервер отобьёт отказом.
+ */
+var TURN_FIRST_WORD_MS = 90000;
+
+/**
+ * Ширина кнопки выхода: она стоит В ОДНОЙ СТРОКЕ с галкой перезаписи, справа.
+ * Своей строки ей не дано нарочно -- строка формы это строка разговора,
+ * а выходят из учётной записи раз в жизни рабочего места.
+ */
+var LOGOUT_W = 150;
+/**
+ * Сколько кнопка выхода ждёт ВТОРОГО щелчка. Взведённая кнопка, забытая
+ * до вечера, -- та же случайность, только позже.
+ */
+var LOGOUT_ARM_MS = 15000;
+/**
+ * Ширина кнопки «Убрать картинки»: она стоит в правом краю строки картинок,
+ * как выход -- в правом краю строки с галкой.
+ */
+var CLEAR_W = 150;
+/**
+ * Сколько картинок берётся за одну просьбу и сколько весит каждая. Числа
+ * ЗЕРКАЛЯТ сервер (`MAX_IMAGES`, `MAX_IMAGE_BYTES` в src/server/http.ts):
+ * отказ на месте показывается сразу при выборе файла, а не строкой 400 после
+ * того, как просьба уже набрана и отправлена.
+ */
+var ATTACH_MAX = 2;
+var ATTACH_MAX_BYTES = 5 * 1024 * 1024;
+/**
+ * Какие картинки берём, по расширению файла. Список ЗЕРКАЛИТ `IMAGE_MIME`
+ * сервера: чего нет здесь, то вернулось бы оттуда отказом.
+ *
+ * Тип берётся из РАСШИРЕНИЯ, а не из содержимого файла: сигнатуру мы всё равно
+ * не читаем, а провайдеру едет `data:`-URI, в котором тип и написан.
+ */
+var ATTACH_TYPES = {
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    webp: 'image/webp',
+    gif: 'image/gif'
+};
+/**
+ * Что просим у диалога Базиса. Расширение там ОДНО (`askFileName(ext)`), а
+ * картинки из интернета приходят jpeg и webp не реже, чем снимки экрана png:
+ * фильтр на `.png` прятал бы от человека ровно тот файл, который он скачал.
+ * Поэтому маска всеядная, а расширение проверяем сами -- по ATTACH_TYPES.
+ */
+var ATTACH_MASK = '*';
+
+/** Заголовок формы; во время хода к нему дописывается пометка. */
+var CHAT_CAPTION = 'Тэрил: ассистент проектировщика';
+/** Он же с пометкой: единственный признак занятости, который мы можем показать. */
+var CHAT_CAPTION_BUSY = CHAT_CAPTION + ' -- идёт ход...';
+/** Он же, пока ждём токен: просить нечем, и заголовок говорит, чего ждут. */
+var CHAT_CAPTION_LOGIN = 'Тэрил: вход';
+/**
+ * Он же, когда скрипт устарел. Просить в этом состоянии нечего: сборка всё
+ * равно отобьётся на версии протокола, и живое поле просьбы обещало бы ход,
+ * которого не будет.
+ */
+var CHAT_CAPTION_STALE = 'Тэрил: нужен новый скрипт';
+/** Заголовок окна настроек места: оно модальное и своё. */
+var PLACE_CAPTION = 'Тэрил: настройки рабочего места';
+
+/* -- ОКНО НАСТРОЕК МЕСТА ----------------------------------------------------
+ *
+ * Чем цех режет и чем он крепит, знает ТОЛЬКО Базис, и спросить его об этом
+ * можно единственным способом -- его же диалогом: имя материала отдаёт окно
+ * материалов (`Action.ChooseMaterial`), а схему присадки -- окно фурнитуры
+ * (`InfFurniture.Choose`). Ни то, ни другое нельзя ни набрать руками, ни
+ * выбрать в браузере: набранное имя `ActiveMaterial.Make` заведёт молча,
+ * и в «Расчёте стоимости» встанет пустая строка, похожая на настоящую,
+ * а значение схемы вне диалога не существует вовсе.
+ *
+ * Отсюда всё устройство: окно живёт ЗДЕСЬ, рядом с диалогами, а выбранное
+ * уезжает на сервер запросом (`POST /api/place`). Разовых скриптов захвата
+ * и файлов, которые человек прикладывал в кабинете, больше нет: они были
+ * обходом того же самого -- диалог в Базисе, а профиль на сервере.
+ *
+ * СТРОК ОКНО НЕ ЗНАЕТ: и материалы, и роли приезжают с сервера
+ * (`GET /api/place`) вместе с тем, что у места уже стоит. Свой список здесь
+ * означал бы вторую копию `naming.ts` на чужой машине -- она разошлась бы
+ * молча, и окно спрашивало бы про плиту, которой в заказе давно нет.
+ *
+ * ОКНО МОДАЛЬНОЕ, и это не оплошность, а выбор из двух зол. Немодальная форма
+ * поверх формы чата встаёт ЗА неё (ровно на этом мы уже обожглись с окном
+ * входа), а настройки, которых не видно, хуже настроек, которые ждут. Цена --
+ * пока окно открыто, цикл опроса стоит: агент не отвечает серверу, и ход
+ * поэтому в это время не идёт (кнопки не видно во время хода, см. `mode`).
+ *
+ * Из-за той же модальности НИЧЕГО НЕ ОТПРАВЛЯЕТСЯ, пока окно открыто: ответ
+ * сервера пришёл бы колбэком, а колбэки под модальным окном не исполняются.
+ * Поэтому окно только собирает выбранное и отдаёт его наружу, а отправляет
+ * уже закрытая форма (см. `openPlace`).
+ * ------------------------------------------------------------------------ */
+
+var PLACE_W = 680;
+var PLACE_H = 720;
+/** Шаг строки: поле плюс воздух. Строк тут третий десяток, и они стоят плотно. */
+var PLACE_ROW_H = FIELD_H + 4;
+var PLACE_PICK_W = 110;
+var PLACE_DROP_W = 110;
+var PLACE_INNER_W = PLACE_W - 2 * PAD - 8;
+/** Верх списка: под строкой-подсказкой. */
+var PLACE_TOP = PAD + FIELD_H + GAP;
+/**
+ * Высота списка: окно за вычетом заголовка (26, замер тот же, что у чата),
+ * полосы кнопок «Сохранить/Отмена» (44 -- её рисует сам Базис) и подсказки.
+ */
+var PLACE_VIEW_H = PLACE_H - 26 - 44 - PLACE_TOP - PAD;
+/** Ширина поля со строкой выбора: за вычетом полосы прокрутки и двух кнопок. */
+var PLACE_FIELD_W = PLACE_INNER_W - 28 - PLACE_PICK_W - PLACE_DROP_W - 8;
+/**
+ * Фильтр диалога фурнитуры: 7 = DatumMode.Scheme. Без него в списке лежит
+ * весь крепёж базы -- сотни позиций, среди которых схему ещё надо найти.
+ */
+var SCHEME_FILTER = 7;
+
+/**
+ * Окно настроек места. Возвращает то, что надо отправить, или null, если
+ * человек закрыл окно «Отменой».
+ *
+ * `data` -- ответ `GET /api/place`: строки окна вместе с выбранным. Строки
+ * схем (`enc`) в нём НЕПРОЗРАЧНЫ и возвращаются обратно как есть: правило
+ * сервера -- присланный раздел заменяет свой целиком, значит окно обязано
+ * прислать и то, чего человек не трогал.
+ */
+function placeForm(data, say) {
+    var mats = data && data.materials ? data.materials : [];
+    var roles = data && data.roles ? data.roles : [];
+
+    var form = NewForm();
+    form.Caption = PLACE_CAPTION;
+    form.Width = PLACE_W;
+    form.Height = PLACE_H;
+    // Размер фиксирован по той же причине, что у чата: раскладка прописана
+    // числами, и растянутое окно показало бы пустую полосу, а не больше строк.
+    form.Resizable = false;
+    form.Dockable = false;
+    form.MinWidth = PLACE_W;
+    form.MinHeight = PLACE_H;
+    // Кнопки формы -- СВОИ, базисные: модальная форма отвечает ими же, и другой
+    // способ узнать «сохранить или нет» у неё есть только один -- закрытие.
+    form.OKButton = true;
+    form.OKButtonCaption = 'Сохранить на сервере';
+    form.CancelButton = true;
+    form.CancelButtonCaption = 'Отмена';
+
+    var props = form.Properties;
+    var hint = props.NewString('');
+    place(hint, PAD, PAD, PLACE_INNER_W, FIELD_H);
+    hint.Value = 'Выбирайте окнами Базиса. «Отмена» в окне выбора оставляет строку как была.';
+    hint.Enabled = false;
+
+    var list = props.NewGroup('');
+    place(list, PAD, PLACE_TOP, PLACE_INNER_W, PLACE_VIEW_H);
+    list.Scrollable = true;
+
+    var top = 0;
+
+    /** Заголовок раздела. Группы для этого не годятся: её имени Базис не показывает. */
+    function header(text) {
+        var p = list.NewString('');
+        place(p, 0, top, PLACE_INNER_W - 28, FIELD_H);
+        p.Value = text;
+        p.Enabled = false;
+        top += PLACE_ROW_H;
+    }
+
+    /** Строка выбора: что выбрано, кнопка выбора и кнопка сброса. */
+    function pickRow(caption, dropCaption, show, onPick, onDrop) {
+        var field = list.NewString(caption);
+        place(field, 0, top, PLACE_FIELD_W, FIELD_H);
+        // Строку не правят руками: имя материала и схему выбирает диалог,
+        // а набранное здесь было бы ровно тем враньём, от которого мы ушли.
+        field.Enabled = false;
+        var pick = list.NewButton('Выбрать');
+        place(pick, PLACE_FIELD_W + 4, top, PLACE_PICK_W, FIELD_H);
+        var drop = list.NewButton(dropCaption);
+        place(drop, PLACE_FIELD_W + 8 + PLACE_PICK_W, top, PLACE_DROP_W, FIELD_H);
+        function render() { field.Value = show(); }
+        render();
+        pick.OnClick = function () { if (onPick()) render(); };
+        drop.OnClick = function () { onDrop(); render(); };
+        top += PLACE_ROW_H;
+    }
+
+    header('-- МАТЕРИАЛЫ И КРОМКА: под каким именем они заведены у вас --');
+    for (var i = 0; i < mats.length; i++) materialRow(mats[i]);
+
+    function materialRow(m) {
+        pickRow(
+            String(m.ours || m.id),
+            // Строка НЕОБЯЗАТЕЛЬНАЯ (лента на скрытый торец) сбрасывается
+            // в «не кромим», а не в наше имя: плита у детали есть всегда,
+            // а лента на невидимый торец -- расход, и берёт его на себя цех.
+            m.optional ? 'Не кромим' : 'Наше имя',
+            function () {
+                if (!m.full && m.optional) return 'не выбрана: не кромим -- ' + (m.role || '');
+                if (!m.full) return 'не выбран: поедет «' + m.ours + '» -- ' + (m.role || '');
+                return (m.name || m.full) + (m.code ? ' (' + m.code + ')' : '');
+            },
+            function () {
+                var full = '';
+                try {
+                    // Окно отдаёт ПОЛНОЕ имя -- с артикулом. Уезжает в модель оно:
+                    // под ним материал и заведён в базе цеха.
+                    full = String(Action.ChooseMaterial() || '');
+                } catch (e) {
+                    say('материал выбрать не вышло: ' + (e && e.message ? e.message : e), 'error');
+                    return false;
+                }
+                // Пусто -- человек нажал «Отмена»: строка остаётся как была.
+                if (!full) return false;
+                m.full = full;
+                // Второе написание, короткое: из модели может вернуться оно.
+                try { m.name = String(ExtractMatName(full) || ''); } catch (e) { m.name = ''; }
+                try { m.code = String(ExtractMatCode(full) || ''); } catch (e) { m.code = ''; }
+                return true;
+            },
+            function () {
+                m.full = '';
+                m.name = '';
+                m.code = '';
+            }
+        );
+    }
+
+    header('-- СХЕМЫ ПРИСАДКИ: чем ваш цех сверлит эти стыки --');
+    for (var j = 0; j < roles.length; j++) schemeRow(roles[j]);
+
+    function schemeRow(r) {
+        pickRow(
+            String(r.label || r.id),
+            'Не сверлим',
+            function () {
+                if (!r.enc) return 'схемы нет: ' + (r.hint || '') + ' -- поедет без присадки';
+                return String(r.name || 'схема выбрана') + (r.fastener ? ' / ' + r.fastener : '');
+            },
+            function () {
+                try {
+                    var v = Action.Properties.NewFurnitureValue();
+                    v.DatumModeFilter = SCHEME_FILTER;
+                    if (!v.Choose()) return false;
+                    if (v.DatumMode !== SCHEME_FILTER) {
+                        say('выбрана не схема, а отдельный крепёж: ' + r.label +
+                            ' так не сверлится -- выберите схему.', 'error');
+                        return false;
+                    }
+                    r.name = String(v.Name);
+                    // Строка самодостаточна: в ней копия всей схемы, а не ссылка.
+                    // Читать её здесь нечем и незачем -- разбирает сервер.
+                    r.enc = String(v.EncodeToString());
+                    // Чем схема крепит, скажет сервер, разобрав строку: до ответа
+                    // второй половины подписи у нас просто нет.
+                    r.fastener = '';
+                    return true;
+                } catch (e) {
+                    say('схему выбрать не вышло: ' + (e && e.message ? e.message : e), 'error');
+                    return false;
+                }
+            },
+            function () {
+                r.enc = '';
+                r.name = '';
+                r.fastener = '';
+            }
+        );
+    }
+
+    /*
+     * ЧЕМ КРЕПИТЬ, КОГДА ЗАКАЗ НЕ СКАЗАЛ. Просьба «поставь шкаф» вида крепежа
+     * не называет, и таких просьб большинство: без умолчания такой шкаф
+     * приехал бы без единого крепежа.
+     *
+     * Список -- ВСЕ стыки корпуса, а не только захваченные: схему на них
+     * выбирают в этом же окне, строкой выше, и список, посчитанный при
+     * открытии, разошёлся бы с ним на глазах. Вид без схемы сервер выбранным
+     * не поставит и скажет об этом строкой.
+     */
+    header('-- ЧЕМ КРЕПИТЬ СТЫКИ КОРПУСА, ЕСЛИ ЗАКАЗ НЕ СКАЗАЛ --');
+    var joints = [];
+    for (var k = 0; k < roles.length; k++) if (roles[k].carcass) joints.push(roles[k]);
+    var combo = list.NewCombo('Крепёж по умолчанию');
+    place(combo, 0, top, PLACE_INNER_W - 28, FIELD_H);
+    combo.AddItem('не выбрано -- стыки корпуса без присадки');
+    var chosen = 0;
+    for (var q = 0; q < joints.length; q++) {
+        combo.AddItem(String(joints[q].label || joints[q].id));
+        if (joints[q].id === data.carcassJoint) chosen = q + 1;
+    }
+    combo.ItemIndex = chosen;
+    top += PLACE_ROW_H;
+
+    if (!form.ShowModal()) return null;
+
+    var outMats = [];
+    for (var a = 0; a < mats.length; a++) {
+        if (mats[a].full) {
+            outMats.push({ id: mats[a].id, full: mats[a].full, name: mats[a].name || '', code: mats[a].code || '' });
+        }
+    }
+    var outRoles = [];
+    for (var b = 0; b < roles.length; b++) {
+        if (roles[b].enc) outRoles.push({ role: roles[b].id, enc: roles[b].enc, name: roles[b].name || '' });
+    }
+    var pickedJoint = combo.ItemIndex > 0 && joints[combo.ItemIndex - 1] ? joints[combo.ItemIndex - 1].id : '';
+    // Разделы уезжают ОБА и ЦЕЛИКОМ: сервер заменяет ими профиль, и «чего
+    // не прислали, того у места и нет». Оттого окно и знает весь профиль.
+    return { materials: outMats, roles: outRoles, carcassJoint: pickedJoint };
+}
+
+function chatForm(opts) {
+    var form = NewForm();
+    form.Caption = CHAT_CAPTION;
+    form.Width = FORM_W;
+    form.Height = FORM_H;
+    /*
+     * РАЗМЕР ОКНА ФИКСИРОВАН, и теперь это не лечение, а следствие: раскладка
+     * прописана числами (см. place выше), поэтому растянутое окно ничего
+     * не переложит -- оно просто покажет пустую полосу справа и снизу. Строк
+     * от растягивания не прибавляется: их число задано CHAT_ROWS.
+     *
+     * `Dockable` снят по той же причине, а не за компанию: пристыкованную
+     * форму размеряет НЕ ОНА, а место, куда её пристыковали, -- то есть
+     * ширина любая и наша раскладка в ней не сходится.
+     */
+    form.Resizable = false;
+    form.Dockable = false;
+    form.MinWidth = form.Width;
+    form.MinHeight = form.Height;
+    // Своих кнопок ОК/Отмена у чата нет: разговор не заканчивается «применить».
+    form.OKButton = false;
+    form.CancelButton = false;
+
+    var props = form.Properties;
+
+    /*
+     * Сначала просьба, под ней разговор: всё, чем пользуются руками, стоит
+     * вверху формы. Группы у просьбы НЕТ -- заголовка её Базис не показывает,
+     * а рамка отъедает края (см. комментарий над place): три свойства лежат
+     * прямо на форме, числами.
+     *
+     * У разговора группа осталась, и ровно за одним: полоса прокрутки бывает
+     * только у группы. Строк в ней заводится больше, чем видно, поэтому полоса
+     * стоит с самого начала и на ходу не появляется -- появление её и вешало
+     * Базис.
+     */
+
+    // Ход к модели рассказывает о себе на ходу: «Читаю модель», «Спрашиваю»,
+    // «токенов столько-то» (сервер шлёт их видом `step`). Своего свойства
+    // у них больше нет вовсе: они идут в СТРОКУ СОСТОЯНИЯ Базиса (`Action.Hint`),
+    // где раньше висело неинтересное «ждёт просьбу». Форма от этого не трогается
+    // вовсе -- а именно её перерисовка и вешала Базис.
+    function status(line) { if (opts.status) opts.status(line); }
+
+    /*
+     * Кнопка остановки -- единственная кнопка этой группы, и здесь она уместна
+     * ровно потому, почему её нет у отправки: она НИЧЕГО НЕ ЧИТАЕТ из поля.
+     * Отправка кнопкой ловила бы незафиксированное значение редактора Базиса,
+     * а остановке читать нечего -- щелчок и есть всё сообщение.
+     *
+     * СТОИТ ОНА НА МЕСТЕ ПОЛЯ и видна ТОЛЬКО ВО ВРЕМЯ ХОДА, а поле с галкой
+     * на это время прячутся: пока ход идёт, просьбу всё равно не отправить
+     * (замок ниже), и живое поле обещало бы то, чего не будет. Меняются они
+     * одним `Visible` -- раскладка прописана числами, двигать нечего.
+     */
+    var text = props.NewString('Что сделать');
+    place(text, PAD, PAD, FORM_INNER_W, FIELD_H);
+    var force = props.NewBool('Разрешить перезапись ручных правок');
+    place(force, PAD, PAD + FIELD_H + GAP, FORM_INNER_W - LOGOUT_W - GAP, FIELD_H);
+    var stopBtn = props.NewButton('Остановить ход');
+    place(stopBtn, PAD, PAD, FORM_INNER_W, FIELD_H);
+    // Между ходами останавливать нечего, поэтому кнопки и нет.
+    stopBtn.Visible = false;
+    // Выход -- в свободный правый край строки с галкой: строк в форме
+    // не прибавляется, а значит не убавляется и разговора. Заводится он
+    // ПОСЛЕ кнопки остановки и стоит числами: порядок создания тут ничего
+    // не значит -- выравнивания у свойств нет вовсе (см. place).
+    var logoutBtn = props.NewButton('Выйти');
+    place(logoutBtn, PAD + FORM_INNER_W - LOGOUT_W, PAD + FIELD_H + GAP, LOGOUT_W, FIELD_H);
+
+    /*
+     * ВХОД -- на месте просьбы. Скрипт раздаётся свободно и токена в себе
+     * не несёт, поэтому первый запуск на новой машине упирается ровно в этот
+     * вопрос; сюда же приводит 401 и выход из учётной записи. Спрашивается он
+     * ЗДЕСЬ, а не отдельной формой: та вставала за окном чата и терялась.
+     *
+     * СПРАШИВАЕТСЯ ОДИН ТОКЕН. Адрес сервера вписывает в файл сайт, когда
+     * отдаёт скрипт, и переспрашивать вписанное значит предлагать ошибиться:
+     * пустое или чужое поле адреса кончается тем же молчанием, что и неверный
+     * токен, только искать причину человек будет в токене.
+     *
+     * Адрес кабинета -- ЖИВЫМ полем, а не подписью: свойство формы Базиса
+     * ссылок не открывает вовсе, а из погашенной подписи нельзя даже выделить
+     * текст -- адрес пришлось бы переписывать с экрана руками. Правка в нём
+     * не значит ничего и стирается обратно.
+     *
+     * Заводятся оба ПОСЛЕ кнопок и стоят числами: порядок создания тут ничего
+     * не значит -- выравнивания у свойств нет вовсе (см. place).
+     */
+    var tokenField = props.NewString('Токен');
+    place(tokenField, PAD, PAD, FORM_INNER_W, FIELD_H);
+    tokenField.Value = '';
+    tokenField.Visible = false;
+    var cabinetUrl = '';
+    var cabinetField = props.NewString('Выдайте токен в кабинете');
+    place(cabinetField, PAD, PAD + FIELD_H + GAP, FORM_INNER_W, FIELD_H);
+    cabinetField.Value = '';
+    cabinetField.Visible = false;
+    // Возврат значения -- это снова фиксация значения, то есть тот же
+    // `OnValueChange`: без замка он входил бы сам в себя (ср. `submit`).
+    var fixing = false;
+    cabinetField.OnValueChange = function () {
+        if (fixing || cabinetField.Value === cabinetUrl) return;
+        fixing = true;
+        cabinetField.Value = cabinetUrl;
+        fixing = false;
+    };
+    // Кнопки «Отправить» здесь НЕТ намеренно: набранное живёт в редакторе
+    // Базиса, пока его не зафиксируют, и щелчок по кнопке всё равно отправлял
+    // не её нажатием, а уходом фокуса из поля. Отправляет Enter в поле.
+    /*
+     * КАРТИНКИ -- третьей строкой просьбы. Кнопка здесь уместна по той же
+     * причине, что и остановка: она НИЧЕГО НЕ ЧИТАЕТ из поля -- щелчок и есть
+     * всё сообщение, а файл спрашивает диалог Базиса (`system.askFileName`).
+     *
+     * Строка стоит своя, а не делится с галкой: подпись «Разрешить перезапись
+     * ручных правок» и без того занимает всю левую половину, и втиснуть туда
+     * третью кнопку значило бы обрезать её на середине слова. Платится за это
+     * одна строка разговора -- 30 точек из окна.
+     *
+     * «Убрать картинки» видна ТОЛЬКО когда есть что убирать (см. `mode`):
+     * приложенное иначе не отцепить ничем, кроме отправки, а ошибиться файлом
+     * проще всего именно в чужом диалоге.
+     */
+    var attachBtn = props.NewButton('Приложить картинку');
+    place(attachBtn, PAD, PAD + 2 * (FIELD_H + GAP), FORM_INNER_W - CLEAR_W - GAP, FIELD_H);
+    var clearBtn = props.NewButton('Убрать картинки');
+    place(clearBtn, PAD + FORM_INNER_W - CLEAR_W, PAD + 2 * (FIELD_H + GAP), CLEAR_W, FIELD_H);
+    clearBtn.Visible = false;
+
+    /*
+     * НАСТРОЙКИ МЕСТА -- четвёртой строкой, во всю ширину. Кнопка здесь
+     * уместна по той же причине, что остановка и картинки: она НИЧЕГО
+     * НЕ ЧИТАЕТ из поля -- щелчок и есть всё сообщение.
+     *
+     * Строка своя, а не поделённая с картинками: за кнопкой открывается окно,
+     * в котором цех рассказывает о себе всё, и звать его сокращением
+     * («Место») значило бы прятать единственную дорогу к настройке.
+     *
+     * Второй щелчок, пока окно открыто, невозможен: окно модальное, и до его
+     * закрытия сюда не доходит ни одно событие.
+     */
+    var placeBtn = props.NewButton('Настройки места: материалы, схемы, крепёж');
+    place(placeBtn, PAD, PAD + 3 * (FIELD_H + GAP), FORM_INNER_W, FIELD_H);
+    placeBtn.OnClick = function () {
+        if (opts.place) opts.place();
+    };
+
+    /*
+     * ОБНОВЛЕНИЕ -- ТУДА ЖЕ, НА МЕСТО ПРОСЬБЫ. Строки в форме не прибавляется:
+     * состояния «устарел» и «просят» одновременно не бывает вовсе -- пока
+     * версии разошлись, ход всё равно кончится отказом на сборке.
+     *
+     * Кнопка здесь уместна по той же причине, что остановка и картинки: она
+     * НИЧЕГО НЕ ЧИТАЕТ из поля -- щелчок и есть всё сообщение.
+     */
+    var updateBtn = props.NewButton('Обновить агента');
+    place(updateBtn, PAD, PAD, FORM_INNER_W, FIELD_H);
+    updateBtn.Visible = false;
+
+    /*
+     * ПРОДОЛЖИТЬ ХОД -- ответ на вопрос сервера, и видна кнопка ровно пока
+     * вопрос задан (событие вида `ask`). Ход сам по себе её не показывает:
+     * продолжать нечего, пока никто не собрался сдаваться.
+     *
+     * Стоит она ВТОРОЙ СТРОКОЙ, под остановкой: во время хода эта строка
+     * пустует (галка с выходом спрятаны), и новых строк форме не прибавляется.
+     * Рядом с «Остановить ход» она читается парой -- два ответа на один
+     * вопрос, и оба на виду.
+     *
+     * Заводится ПОСЛЕДНЕЙ и стоит числами: порядок создания тут ничего
+     * не значит -- выравнивания у свойств нет вовсе (см. place).
+     */
+    var moreBtn = props.NewButton('Продолжить ход');
+    place(moreBtn, PAD, PAD + FIELD_H + GAP, FORM_INNER_W, FIELD_H);
+    moreBtn.Visible = false;
+
+    var images = [];
+    var dialog = props.NewGroup('');
+    place(dialog, PAD, CHAT_TOP, FORM_INNER_W, CHAT_VIEW_H);
+    dialog.Scrollable = CHAT_SCROLL_X > 1;
+
+    // Строки разговора: свойства формы создаются ЗДЕСЬ и больше никогда.
+    var rows = [];
+    // Что в них показано, СВЕРХУ ВНИЗ: rows[0] -- верхняя строка окна, там же
+    // и shown[0]. Длиннее пула не бывает: старое уходит за его край и остаётся
+    // только в agent.log.
+    var shown = [];
+
+    for (var r = 0; r < CHAT_POOL; r++) {
+        var p = dialog.NewString('');
+        // Ширина -- за вычетом рамки группы и полосы прокрутки. Считать надо
+        // С ЗАПАСОМ: строка шире клиентской области хоть на точку поднимает
+        // ГОРИЗОНТАЛЬНУЮ полосу прокрутки, и та съедает нижнюю строку окна.
+        place(p, 0, r * ROW_H, FORM_INNER_W - (dialog.Scrollable ? 28 : 8), ROW_H);
+        p.Value = '';
+        // Строку разговора не редактируют: это ответ, а не поле ввода.
+        p.Enabled = false;
+        // Пустая строка НЕ ПОКАЗЫВАЕТСЯ: два десятка пустых рамок в окне --
+        // это и мусор в глазах, и лишняя отрисовка, и напрасная длина
+        // прокрутки. Показываются ровно занятые (см. render).
+        p.Visible = false;
+        rows.push(p);
+    }
+
+    /*
+     * Пока идёт ход, вторая просьба не отправляется: замок держит ФОРМА,
+     * а не Базис.
+     *
+     * Гасить поле (`Enabled = false`) пробовали первым делом -- и это НЕ
+     * РАБОТАЕТ: у свойства формы `Enabled` значит «выделяемость», редактор
+     * Базиса остаётся живым, и человек преспокойно набирает в погашенное поле.
+     * Полагаться на невозможное нельзя, поэтому замок здесь свой: просьба,
+     * поданная во время хода, никуда не уходит, а получает ответ на месте --
+     * без круга до сервера и обратно ради того же самого отказа (`/api/turn`
+     * ответил бы 409: модель Базиса одна, второй ход начинать не на чем).
+     *
+     * Набранное при этом СОХРАНЯЕТСЯ в поле: человек написал просьбу, она
+     * не отправлена -- стереть её значило бы заставить писать заново.
+     *
+     * Видимый признак занятости остаётся один, и его мы правда можем показать:
+     * ЗАГОЛОВОК ФОРМЫ. Он не участвует в раскладке -- перерисовывается полоса
+     * заголовка, а не два десятка свойств.
+     *
+     * Снимает замок ТОЛЬКО событие `done` -- сервер шлёт его последним
+     * в каждом ходе, чем бы тот ни кончился. Гадать по последней строке
+     * отчёта нельзя: у каждого хода она своя.
+     */
+    var turning = false;
+    var asking = false;
+    var waiting = null;
+    /**
+     * Сервер спросил и ждёт ответа. Снимается ЛЮБЫМ следующим событием: чем бы
+     * вопрос ни кончился -- ответом, молчанием, остановкой, -- сервер сразу
+     * говорит, что дальше, и кнопке после этого отвечать уже нечему.
+     */
+    var pendingAsk = false;
+    /** Версия сервера, когда она разошлась с нашей. Ноль -- не расходилась. */
+    var outdated = 0;
+
+    /*
+     * Четыре состояния верха формы, и место у них ОДНО: просьба, ход, вход,
+     * обновление. Считаются они здесь целиком, а не правятся по свойству
+     * в каждом переходе: переходов между ними дюжина, и «кто что спрятал»
+     * иначе расходится -- ход, начатый до входа, оставлял бы кнопку остановки
+     * поверх поля токена.
+     *
+     * Старшинство: вход, потом ход, потом обновление. Пока токена нет,
+     * отправлять некуда; пока ход идёт, скрипт менять под ним нельзя вовсе --
+     * ход доживёт свой шаг и на старом.
+     */
+    function mode() {
+        var turn = turning && !asking;
+        // Имя местное и короткое: `stale` ниже -- функция, которая это
+        // состояние ставит, и одно имя на два смысла путало бы читателя.
+        var upd = outdated && !asking && !turn;
+        tokenField.Visible = asking;
+        cabinetField.Visible = asking;
+        // Кнопка остановки встаёт НА МЕСТО поля: пока ход идёт, просить нечего,
+        // а вот остановить -- есть что.
+        text.Visible = !asking && !turn && !upd;
+        force.Visible = !asking && !turn && !upd;
+        // Выход во время хода прячется вместе с просьбой: он гасит цикл опроса,
+        // а ход идёт на сервере и о форме не знает -- вышли бы посреди сборки.
+        // Пока ждём токен, выходить тоже неоткуда.
+        // Выход из строки с галкой не уходит и на устаревшем скрипте: место
+        // могли отозвать ровно в тот же день, и запирать выход обновлением
+        // значило бы держать чужой токен на машине до перезапуска.
+        logoutBtn.Visible = !asking && !turn;
+        stopBtn.Visible = turn;
+        moreBtn.Visible = turn && pendingAsk;
+        updateBtn.Visible = !!upd;
+        // Картинки прикладываются К ПРОСЬБЕ и живут ровно столько же: пока
+        // просьбы не видно, прикладывать не к чему.
+        attachBtn.Visible = !asking && !turn && !upd;
+        // Убирать нечего, пока ничего не приложено, -- кнопки поэтому и нет.
+        clearBtn.Visible = !asking && !turn && !upd && images.length > 0;
+        // Настройки места -- работа между ходами: во время хода окно отобрало
+        // бы у агента цикл опроса (оно модальное), а до входа их некуда
+        // и незачем спрашивать -- профиль лежит у места на сервере.
+        placeBtn.Visible = !asking && !turn && !upd;
+        form.Caption = asking ? CHAT_CAPTION_LOGIN
+            : turn ? CHAT_CAPTION_BUSY
+            : upd ? CHAT_CAPTION_STALE
+            : CHAT_CAPTION;
+    }
+
+    /*
+     * Завести сторожа заново. Зовётся не только в начале хода, но и НА КАЖДОМ
+     * СОБЫТИИ: сторож стоит против МОЛЧАНИЯ сервера, а событие -- прямое
+     * доказательство, что тот жив. Считай мы его от начала хода, продлённый
+     * ход (человек ответил «продолжать») упирался бы в сторожа на пятнадцатой
+     * минуте, хотя сервер всё это время рассказывал о себе.
+     *
+     * Сроков у сторожа два, и выбирает их вызов. `arm(true)` -- начало хода,
+     * когда сказано ещё НИЧЕГО: полторы минуты. `arm()` -- любое событие
+     * после: ход разговаривает, и молчать ему позволено пятнадцать минут.
+     */
+    function arm(firstWord) {
+        if (waiting) clearTimeout(waiting);
+        waiting = setTimeout(function () {
+            waiting = null;
+            var why = firstWord
+                ? 'Просьба ушла, но за ' + Math.round(TURN_FIRST_WORD_MS / 1000) +
+                  ' с сервер не сказал о ней ни слова, а первый шаг приходит за секунду. ' +
+                  'Значит до формы не доходят события: закройте её и запустите скрипт заново, ' +
+                  'а если не поможет -- пришлите нам agent.log. Снимаю замок.'
+                : 'Сервер молчит дольше ' + Math.round(TURN_WATCHDOG_MS / 60000) +
+                  ' минут: снимаю замок. Если ход всё-таки идёт, ответ на новую просьбу будет отказом.';
+            append(why, 'error');
+            // В ЖУРНАЛ ТОЖЕ: слова формы сами по себе в agent.log не попадают,
+            // а присылают нам именно его -- и молчание в нём читается как
+            // смерть скрипта (см. разбор в tests/bazis/await-token.test.ts).
+            if (opts.log) opts.log('WARN', firstWord ? 'ход не сказал ни слова за ' +
+                Math.round(TURN_FIRST_WORD_MS / 1000) + ' с: снимаю замок' :
+                'сервер молчит дольше ' + Math.round(TURN_WATCHDOG_MS / 60000) + ' минут: снимаю замок');
+            ready();
+        }, firstWord ? TURN_FIRST_WORD_MS : TURN_WATCHDOG_MS);
+    }
+    function busy() {
+        turning = true;
+        mode();
+        // Первое слово -- по короткому сроку: ход, который не начался,
+        // не должен стоить человеку четверти часа.
+        arm(true);
+    }
+    function ready() {
+        if (waiting) { clearTimeout(waiting); waiting = null; }
+        turning = false;
+        pendingAsk = false;
+        mode();
+    }
+
+    /**
+     * Спросить токен: поле входа встаёт на место просьбы. Второй формы для
+     * этого больше нет -- она всплывала за окном чата.
+     *
+     * Разговор при этом ОСТАЁТСЯ: сюда приходят и с 401 посреди работы,
+     * и выходом из учётной записи, и строки, сказанные до того, объясняют,
+     * почему поле вдруг спрашивает токен.
+     */
+    /**
+     * Скрипт устарел: просьбу прячем, кнопку обновления показываем.
+     * Ноль возвращает форму к работе -- так она выглядит после того, как
+     * версии сошлись (перезапустили уже новый файл).
+     */
+    function stale(serverVersion) {
+        outdated = Number(serverVersion) || 0;
+        mode();
+    }
+
+    function askToken(url) {
+        asking = true;
+        taking = false;
+        cabinetUrl = (url || '') + '/cabinet';
+        cabinetField.Value = cabinetUrl;
+        tokenField.Value = '';
+        mode();
+        append('Токен виден один раз при выдаче. Потеряли -- выдайте новый в кабинете.');
+    }
+
+    /*
+     * Фиксация токена отдаёт его наружу ОДИН раз: приходит она и на Enter,
+     * и на уходе фокуса, а поле чистится тут же -- то есть снова `OnValueChange`
+     * (ср. `submit`), и без замка вход входил бы сам в себя.
+     */
+    var taking = false;
+    tokenField.OnValueChange = function () {
+        if (!asking || taking) return;
+        var t = String(tokenField.Value || '').replace(/^\s+|\s+$/g, '');
+        if (!t) return;
+        /*
+         * ОБРЫВОК ОТБИВАЕТСЯ ЗДЕСЬ, и поле остаётся открытым. Уедь он
+         * на сервер -- ответом был бы 401, то есть «токен не признан»: слово
+         * в слово то же, что говорится про отозванное место, и человек ищет
+         * причину в кабинете вместо того, чтобы посмотреть на вставленное.
+         * Что именно не так, видно отсюда и сразу (см. tokenComplaint).
+         */
+        var bad = tokenComplaint(t);
+        if (bad) {
+            taking = true;
+            try { tokenField.Value = ''; } finally { taking = false; }
+            append(bad, 'error');
+            if (opts.log) opts.log('WARN', 'введён не токен: ' + bad.split('.')[0]);
+            return;
+        }
+        taking = true;
+        try {
+            tokenField.Value = '';
+            asking = false;
+            mode();
+        } finally {
+            taking = false;
+        }
+        if (opts.login) opts.login(t);
+    };
+
+    // Строки одного сообщения, пока оно собирается.
+    var pending = [];
+
+    /** Строка в окно разговора. Показывается она позже, разом со всем ходом. */
+    function put(line) {
+        pending.push(line);
+    }
+
+    /**
+     * Сообщение встаёт НАД прежним разговором: новое сверху, старое уходит
+     * вниз и за край окна. Кладётся оно ЦЕЛИКОМ, а не построчно: иначе строки
+     * одного ответа легли бы задом наперёд.
+     *
+     * Порядок в `shown` -- видимый, сверху вниз: строки окна стоят числами,
+     * и `rows[0]` это верхняя строка. Значит новое кладётся в НАЧАЛО массива,
+     * а обрезается ХВОСТ -- низ окна, самое старое.
+     */
+    function flush() {
+        if (!pending.length) return;
+        shown = pending.concat(shown);
+        pending = [];
+        if (shown.length > CHAT_POOL) shown = shown.slice(0, CHAT_POOL);
+    }
+
+    /**
+     * Переписать окно. Разговор ПРИЖАТ К ВЕРХУ: строка i окна и есть строка i
+     * разговора, поэтому самое новое видно всегда, а прокрутка нужна только
+     * за старым. Незанятые строки ПРЯЧУТСЯ -- пустых рамок в окне не остаётся,
+     * и прокрутка длиной ровно в разговор.
+     *
+     * Значение ставится ТОЛЬКО там, где оно поменялось: лишняя запись --
+     * лишняя перерисовка, а строк тут под сотню.
+     */
+    function render() {
+        var n = 0;
+        for (var i = 0; i < CHAT_POOL; i++) {
+            var want = i < shown.length ? shown[i] : '';
+            var vis = want !== '';
+            if (rows[i].Value !== want) { rows[i].Value = want; n++; }
+            if (rows[i].Visible !== vis) rows[i].Visible = vis;
+        }
+        // След ПОСЛЕ записи: если окно встаёт на переписывании строк, этой
+        // строки в журнале не будет, а предыдущая назовёт сообщение.
+        if (opts.trace) opts.trace('render ' + n + ' строк');
+    }
+
+    /** Длинную строку режем сами: свойство показывает её одной полосой. */
+    function wrap(line) {
+        var out = [];
+        while (line.length > CHAT_WRAP) {
+            var cut = line.lastIndexOf(' ', CHAT_WRAP);
+            if (cut < CHAT_WRAP / 2) cut = CHAT_WRAP;
+            out.push(line.substring(0, cut));
+            line = '  ' + line.substring(cut).replace(/^ +/, '');
+        }
+        out.push(line);
+        return out;
+    }
+
+    function append(textLine, kind) {
+        var whole = String(textLine === undefined ? '' : textLine);
+        var lines = whole.split('\n');
+
+        // Сервер жив -- сторож заводится заново (см. arm).
+        if (turning) arm();
+        /*
+         * Вопрос снимается ЛЮБЫМ следующим событием, а не по своему сроку:
+         * сроку этому цена -- вера в то, что наши часы идут как серверные,
+         * а событие приезжает ровно тогда, когда там уже решено. Щелчок
+         * по кнопке, которая пережила свой вопрос, сервер вернёт как
+         * «отвечать было не на что» -- и это тоже сказано словами.
+         */
+        if (kind === 'ask') {
+            pendingAsk = true;
+            mode();
+        } else if (pendingAsk) {
+            pendingAsk = false;
+            mode();
+        }
+
+        // `step` -- ход, а не разговор: «Читаю модель», «Спрашиваю», «токенов
+        // столько-то». Через минуту такая строка не нужна вовсе, и она
+        // ПЕРЕПИСЫВАЕТ строку состояния, не добавляя в форму ни свойства.
+        // Итог хода приезжает `log` и ложится в диалог, как и прежде.
+        if (kind === 'step') {
+            status(lines[0]);
+            return;
+        }
+
+        // `done` -- конец хода, а не разговор: сервер свободен, замок снят.
+        // Строки в диалоге у него нет -- в agent.log она уже легла, а окну
+        // эта новость видна заголовком.
+        if (kind === 'done') {
+            ready();
+            status('');
+            return;
+        }
+
+        var mark = kind === 'me' ? '> ' : kind === 'error' ? '! ' : kind === 'bot' ? '* '
+            : kind === 'ask' ? '? ' : '  ';
+        // Отчёт проверки бывает в полсотни строк, и каждая -- свойство формы.
+        // Показываем начало: целиком отчёт всё равно уехал в agent.log.
+        if (lines.length > CHAT_BLOCK) {
+            var hidden = lines.length - CHAT_BLOCK;
+            lines = lines.slice(0, CHAT_BLOCK);
+            lines.push('... ещё ' + hidden + ' строк -- целиком в agent.log');
+        }
+        for (var i = 0; i < lines.length; i++) {
+            var parts = wrap(lines[i]);
+            for (var j = 0; j < parts.length; j++) put((i === 0 && j === 0 ? mark : '  ') + parts[j]);
+        }
+        // Один раз на сообщение, а не на строку: отчёт в полсотни строк стоит
+        // столько же, сколько одна, -- окно-то всё равно одно.
+        flush();
+        render();
+    }
+
+    /*
+     * Остановка -- просьба к СЕРВЕРУ, а не к форме: ход идёт там, и здесь
+     * о нём не известно ничего. Замок от щелчка не снимается: ход ещё доживает
+     * свой шаг, и снимет его тот же `done`, что и всегда.
+     */
+    stopBtn.OnClick = function () {
+        if (!opts.stop) return;
+        status('Останавливаю ход…');
+        opts.stop();
+    };
+
+    /*
+     * Продолжить -- такая же просьба к СЕРВЕРУ, как и остановка: решение
+     * принимает ход, который там идёт. Кнопка гаснет сразу, не дожидаясь
+     * ответа: второй щелчок по тому же вопросу всё равно ничего не значит.
+     */
+    moreBtn.OnClick = function () {
+        if (!opts.more) return;
+        pendingAsk = false;
+        mode();
+        status('Продолжаю ход…');
+        opts.more();
+    };
+
+    /*
+     * Выход из учётной записи спрашивает ВТОРОЙ ЩЕЛЧОК, и это не вежливость:
+     * он стирает токен с машины, а кабинет показывает токен ОДИН раз при
+     * выдаче -- случайный щелчок стоил бы перевыпуска места.
+     *
+     * Спрашивается он строкой в разговоре, а не окном подтверждения: своего
+     * окна у Базиса нет, а вторая форма поверх формы -- то же зависание,
+     * от которого лечилась эта.
+     */
+    var armed = null;
+    logoutBtn.OnClick = function () {
+        if (!opts.logout) return;
+        if (armed) {
+            clearTimeout(armed);
+            armed = null;
+            opts.logout();
+            return;
+        }
+        append('Выход сотрёт токен с этой машины, а кабинет показывает его один раз при выдаче. ' +
+            'Щёлкните «Выйти» ещё раз, чтобы выйти.', 'error');
+        armed = setTimeout(function () {
+            armed = null;
+            append('Выход отменён: второго щелчка не было.');
+        }, LOGOUT_ARM_MS);
+    };
+
+    /*
+     * ОБНОВИТЬСЯ -- значит скачать новый файл и лечь на его место. Перезапуск
+     * при этом остаётся человеку, и не по лени: скрипт исполняется командой
+     * Базиса из открытого в редакторе файла и держится на `Action.Continue()`,
+     * а подменить исполняемый код в том же процессе нечем. Скачать, положить
+     * и сказать, что открыть, -- всё, что тут можно сделать честно.
+     *
+     * Второй щелчок по кнопке, пока идёт первый, не делает ничего: качается
+     * файл секунды, а спрашивают о нём один раз.
+     */
+    var updating = false;
+    updateBtn.OnClick = function () {
+        if (!opts.update || updating) return;
+        updating = true;
+        status('Качаю новый скрипт…');
+        opts.update(function () {
+            updating = false;
+            status('');
+        });
+    };
+
+    /** Расширение файла, строчными и без точки. Нет точки -- нет расширения. */
+    function fileExt(file) {
+        var name = String(file).replace(/^.*[\\/]/, '');
+        var dot = name.lastIndexOf('.');
+        return dot > 0 ? name.substring(dot + 1).toLowerCase() : '';
+    }
+
+    /*
+     * Приложить картинку. Диалог файла -- `system.askFileName`, МЕТОД system,
+     * а не глобальная функция (как и `system.apiVersion`): голым именем он
+     * падает `askFileName is not defined`, и падение это тихое -- ошибка
+     * ложится строкой в разговор, а кнопка выглядит сломанной без причины.
+     *
+     * Спрашивается ВСЁ (`ATTACH_MASK`), а тип берётся из расширения выбранного
+     * файла: фильтровать нечем -- расширение у диалога одно, а прикладывают
+     * и снимок экрана (png), и картинку из интернета (jpeg, webp). Чужой
+     * файл при этом не поедет: расширение вне `ATTACH_TYPES` -- отказ на месте.
+     *
+     * Ход при этом НЕ ИДЁТ: во время хода кнопки не видно вовсе (см. `mode`),
+     * а приложенное ждёт ближайшей просьбы.
+     */
+    attachBtn.OnClick = function () {
+        if (images.length >= ATTACH_MAX) {
+            append('картинок уже ' + ATTACH_MAX + ': больше за одну просьбу не берём.', 'error');
+            return;
+        }
+        var file = '';
+        try { file = system.askFileName(ATTACH_MASK); } catch (e) { append('картинку выбрать не вышло: ' + e.message, 'error'); }
+        if (!file) return;
+        // hasOwnProperty, а не просто чтение: `ATTACH_TYPES['constructor']`
+        // отдало бы функцию, и она уехала бы вместо типа.
+        var ext = fileExt(file);
+        var mime = Object.prototype.hasOwnProperty.call(ATTACH_TYPES, ext) ? ATTACH_TYPES[ext] : null;
+        if (!mime) {
+            append('это не картинка: беру png, jpg, webp и gif.', 'error');
+            return;
+        }
+        try {
+            var fs = require('fs');
+            var buf = fs.readFileSync(file);
+            if (buf.length > ATTACH_MAX_BYTES) {
+                append('картинка больше ' + Math.round(ATTACH_MAX_BYTES / (1024 * 1024)) +
+                    ' МБ: столько не примет сервер.', 'error');
+                return;
+            }
+            images.push({ mime: mime, b64: buf.toString('base64'), name: file });
+            append('приложено: ' + file + ' (картинок: ' + images.length + ')');
+            mode();
+        } catch (e) {
+            append('картинку прочитать не вышло: ' + e.message, 'error');
+        }
+    };
+
+    // Убрать приложенное целиком: по одной их не отцепить -- список показан
+    // строками разговора, а не свойствами формы, и щёлкать в нём нечего.
+    clearBtn.OnClick = function () {
+        if (images.length === 0) return;
+        append('картинки убраны: было ' + images.length + '.');
+        images = [];
+        mode();
+    };
+
+    /*
+     * Отправляет просьбу ФИКСАЦИЯ значения поля, а не отдельная кнопка.
+     * Набранное живёт в редакторе Базиса, пока его не ЗАФИКСИРУЮТ: до этого
+     * `text.Value` -- прежнее значение, и кнопка, читающая его, отправляла бы
+     * пустоту, пока не нажмёшь Enter. Фиксируют же значение привычные жесты:
+     * Enter в поле и уход фокуса из него. Поэтому обработчик висит на
+     * `OnValueChange` -- ему и достаётся вся отправка.
+     */
+    var sending = false;
+    function submit() {
+        // Поле чистится ВНУТРИ отправки, а это снова `OnValueChange`: без замка
+        // ход входил бы сам в себя.
+        if (sending) return;
+        var t = text.Value;
+        if (!t) return;
+        // Токена нет -- отправлять некуда, а поле просьбы в это время и не
+        // показано вовсе (см. `mode`): сюда можно попасть только фиксацией,
+        // догнавшей нас уже после 401.
+        if (asking) return;
+        // Ход идёт: отвечаем на месте и НЕ ЧИСТИМ поле -- набранное пригодится,
+        // когда ход кончится.
+        if (turning) {
+            append('Ход идёт: просьба не отправлена. Дождитесь ответа или нажмите «Остановить ход».', 'error');
+            return;
+        }
+        sending = true;
+        try {
+            var mine = images;
+            var allow = force.Value === true;
+            images = [];
+            text.Value = '';
+            // Подпись ставится под КОНКРЕТНОЙ правкой, а не включается навсегда.
+            force.Value = false;
+            append(t + (mine.length ? ' (картинок: ' + mine.length + ')' : ''), 'me');
+            status('просьба отправлена...');
+            // Гасим ДО отправки: ответ сервера приедет колбэком, а щёлкать
+            // и набирать человек может уже в эту миллисекунду.
+            busy();
+            opts.send(t, mine, allow);
+        } finally {
+            sending = false;
+        }
+    }
+
+    text.OnValueChange = submit;
+
+    form.OnClose = function () {
+        if (opts.close) opts.close();
+    };
+
+    form.Show();
+    // `ready` наружу -- для случаев, когда хода не случилось ВОВСЕ: просьба
+    // не дошла до сервера, сервер её не принял, останавливать было нечего.
+    // Событие `done` в этих случаях не приедет никогда, и замок остался бы
+    // запертым до перезапуска скрипта.
+    return { append: append, ready: ready, askToken: askToken, stale: stale, form: form };
+}
+
+/*
+ * Ошибка сети -- ЧЕЛОВЕКУ, а не разработчику. До Базиса доходит меньшинство
+ * тех, кто скачал агента, и на этом месте человек видел сырую строку node
+ * (`connect ETIMEDOUT 148.135.185.73:443`), из которой не следует ни причины,
+ * ни шага. Разбираем `err.code` и отвечаем двумя строками: причина и что
+ * с ней делать. `say` и `append` многострочный текст разбивают сами.
+ *
+ * Самая частая причина здесь -- НЕ поломка сети: на пиратских сборках Базиса
+ * исходящие из `Bazis.exe` рубит правило брандмауэра, и наружу не выходит
+ * только он один. Поэтому таймаут ведёт к doctor, а не к «проверьте интернет».
+ */
+function netReason(err) {
+    if (!err) return '';
+    // Наш собственный `req.setTimeout` роняет запрос с этим сообщением и БЕЗ
+    // кода: сеть жива, сервер просто не успел. Отсылать такого к брандмауэру
+    // значило бы гнать человека чинить работающее.
+    if (!err.code && err.message === 'timeout') {
+        return 'сервер не ответил вовремя.\nЭто не отказ сети -- повторите просьбу.';
+    }
+    var code = err.code;
+    if (code === 'ETIMEDOUT' || code === 'ECONNREFUSED' || code === 'EHOSTUNREACH' || code === 'ENETUNREACH') {
+        return 'сервер не ответил (' + code + ').\n' +
+            'Чаще всего исходящие соединения из Базиса закрыты брандмауэром. ' +
+            'Откройте PowerShell и выполните: irm https://teril.ru/doctor.ps1 | iex';
+    }
+    if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
+        return 'адрес сервера не разрешается (' + code + ').\n' +
+            'Это DNS или сети нет вовсе -- проверьте, открывается ли teril.ru в браузере.';
+    }
+    if (code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' || code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+        code === 'DEPTH_ZERO_SELF_SIGNED_CERT' || code === 'CERT_HAS_EXPIRED') {
+        return 'сертификат сервера не принят (' + code + ').\n' +
+            'Соединение перехватывает антивирус или корпоративный прокси, подменяя сертификат.';
+    }
+    if (code === 'EPROTO' || code === 'ECONNRESET') {
+        return 'соединение оборвано на полпути (' + code + ').\n' +
+            'Так же выглядит перехват антивирусом или прокси.';
+    }
+    return err.message;
+}
+
+function startAgent(config) {
+    var http = require('http');
+    var https = require('https');
+    var url = require('url');
+    var fs = require('fs');
+
+    try { fs.mkdirSync(AGENT_DIR); } catch (e) {}
+    var cfg = agentConfig(config, fs);
+    var RELAY_URL = cfg.url;
+    var RELAY_TOKEN = cfg.token;
+
+    var parsed, transport;
+    /**
+     * Куда и с чем ходим. Отдельной функцией, потому что адрес и токен
+     * МЕНЯЮТСЯ НА ХОДУ: их вводят формой при первом запуске и переввoдят,
+     * когда сервер ответил 401 (место отозвали, токен перевыдали).
+     */
+    function setEndpoint(u, t) {
+        RELAY_URL = u;
+        RELAY_TOKEN = t;
+        parsed = url.parse(RELAY_URL);
+        transport = parsed.protocol === 'https:' ? https : http;
+    }
+    setEndpoint(RELAY_URL, RELAY_TOKEN);
+
+    var POLL_TIMEOUT_MS = 60000;
+    var RESULT_TIMEOUT_MS = 30000;
+    var RETRY_DELAY_MS = 3000;
+    // Пол между опросами. Долгое удержание /poll -- соглашение релея, а не
+    // гарантия: любой БЫСТРЫЙ ответ без задачи (204 от прокси, 200 с не-JSON от
+    // заглушки туннеля, вернувшийся релей) крутил бы цикл на нулевой задержке.
+    // А цикл живёт в UI-потоке Базиса, и сотни запросов в секунду -- это не
+    // лишний трафик, это «Базис висит». Пауза считается от НАЧАЛА опроса,
+    // поэтому честно выдержанный long-poll возвращается в цикл сразу.
+    var MIN_POLL_INTERVAL_MS = 1000;
+    /** Как часто цикл отмечается в журнале, когда задач нет вовсе. */
+    var ALIVE_MS = 30000;
+
+    var host = bazisHost();
+    // Журнал сборки пишет applyJob, а знает про файл только startAgent:
+    // отдаём ему запись, а не путь. Без этого агент остаётся молчаливым.
+    host.log = function (level, msg) { log(level, msg); };
+
+    /*
+     * Журнал пишется В ФАЙЛ ПЕРВЫМ ДЕЛОМ, и это не мелочь порядка строк.
+     * Консоль Базиса -- ОКНО ПРИЛОЖЕНИЯ, то есть та же Delphi-раскладка, что
+     * и форма: писать в неё, охотясь на зависание окна, значит подозреваемым
+     * же и вести протокол. Пока `console.log` шёл первым, застрявший на нём
+     * вызов не оставлял в файле НИЧЕГО, и место смерти выглядело на строку
+     * раньше настоящего. Поэтому: файл всегда, консоль -- только если её
+     * попросили явно (`{"console": true}` в server.json).
+     */
+    function log(level, msg) {
+        var line = new Date().toISOString() + ' [' + level + '] ' + msg;
+        try {
+            if (fs.statSync(LOG_FILE).size > LOG_MAX) fs.writeFileSync(LOG_FILE, '');
+        } catch (e) {}
+        try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch (e) {}
+        if (cfg.console) { try { console.log(line); } catch (e) {} }
+    }
+
+    /*
+     * След шагов внутри одной задачи. Обычный журнал говорит «задача пришла»
+     * и «задача сделана», а зависание живёт МЕЖДУ ними: подсказка в строке
+     * состояния, разбор задачи, дописывание строк в форму -- каждый шаг трогает
+     * окно Базиса и каждый может встать. Пишется только в файл и по одной
+     * короткой строке на шаг; снимается `{"trace": false}` в server.json.
+     */
+    function trace(step) {
+        if (cfg.trace) log('T', step);
+    }
+
+    /*
+     * Живые запросы -- чтобы их было чем оборвать при закрытии формы.
+     * Закрытие ЗАКАНЧИВАЕТ команду Базиса (`Action.Finish`), а вместе с ней
+     * и цикл node внутри node.dll. Оборванный на полуслове TLS-сокет (после
+     * переезда на https их два: сокет и обёртка) роняет цикл на проверке
+     * `UV__HANDLE_CLOSING` -- окном «Assertion failed! loop-watcher.c:121»,
+     * за «Прервать» в котором падает весь Базис. Поэтому перед концом команды
+     * запросы гасятся ЯВНО, а сам конец откладывается на итерацию цикла.
+     */
+    var live = [];
+    var closing = false;
+    /**
+     * Что делать, когда сервер ответил 401. Ставится в самом конце запуска
+     * (там же, где спрашивается токен), а зовётся отсюда -- из ответа на любой
+     * запрос: отозванное место одинаково отбивает и опрос, и просьбу, и сессию.
+     */
+    var onUnauthorized = null;
+
+    function request(method, path, body, timeoutMs, cb) {
+        var payload = body !== undefined ? JSON.stringify(body) : null;
+        var headers = { 'Authorization': 'Bearer ' + RELAY_TOKEN };
+        if (payload !== null) {
+            headers['Content-Type'] = 'application/json';
+            headers['Content-Length'] = Buffer.byteLength(payload);
+        }
+        var answered = false;
+        // Ответ ровно один: оборванный нами запрос отвечает ошибкой, и звать
+        // за ней колбэк было бы «сервер не ответил» поверх закрытой формы.
+        function answer(err, status, data) {
+            if (answered) return;
+            answered = true;
+            var i = live.indexOf(req);
+            if (i >= 0) live.splice(i, 1);
+            if (closing) return;
+            // 401 разбирается ЗДЕСЬ, а не в каждом колбэке: отозванное место
+            // одинаково отбивает и опрос, и просьбу, и начало сессии, и три
+            // разных сообщения об одном и том же ничего не добавляют.
+            if (status === 401 && onUnauthorized) { onUnauthorized(); return; }
+            cb(err, status, data);
+        }
+        var req = transport.request({
+            hostname: parsed.hostname, port: parsed.port, path: path, method: method, headers: headers
+        }, function (res) {
+            var chunks = [];
+            res.on('data', function (c) { chunks.push(c); });
+            res.on('end', function () {
+                var raw = Buffer.concat(chunks).toString('utf8');
+                var data = null;
+                if (raw) { try { data = JSON.parse(raw); } catch (e) {} }
+                answer(null, res.statusCode, data);
+            });
+        });
+        live.push(req);
+        req.setTimeout(timeoutMs, function () { req.destroy(new Error('timeout')); });
+        req.on('error', function (e) { answer(e); });
+        if (payload !== null) req.write(payload);
+        req.end();
+    }
+
+    /*
+     * СКАЧАТЬ ФАЙЛ, а не поговорить с сервером. Отдельно от `request`, и это
+     * не дублирование ради удобства: тот разбирает ответ как JSON и отдаёт
+     * объект, а скрипт приезжает БАЙТАМИ в Windows-1251 -- в кодировке
+     * редактора Базиса. Прочти мы его строкой, русские сообщения агента легли
+     * бы в файл кракозябрами.
+     *
+     * Токена запрос не несёт: файл на сервере открыт всем (его же дают тому,
+     * у кого токена ещё нет вовсе), а гасится он тем же `live`, что и прочие,
+     * -- закрытая форма не должна оставлять живой сокет.
+     */
+    function fetchFile(path, timeoutMs, cb) {
+        var answered = false;
+        function answer(err, status, buf) {
+            if (answered) return;
+            answered = true;
+            var i = live.indexOf(req);
+            if (i >= 0) live.splice(i, 1);
+            if (closing) return;
+            cb(err, status, buf);
+        }
+        var req = transport.request({
+            hostname: parsed.hostname, port: parsed.port, path: path, method: 'GET'
+        }, function (res) {
+            var chunks = [];
+            res.on('data', function (c) { chunks.push(c); });
+            res.on('end', function () { answer(null, res.statusCode, Buffer.concat(chunks)); });
+        });
+        live.push(req);
+        req.setTimeout(timeoutMs, function () { req.destroy(new Error('timeout')); });
+        req.on('error', function (e) { answer(e); });
+        req.end();
+    }
+
+    /**
+     * Рабочий стол -- запасное место, когда файл не выбрали. Видное: положенное
+     * туда человек находит без пути строкой, а именно за этим он к файлу
+     * и пойдёт. Окружение Базис пробрасывает не всегда, поэтому и у этого
+     * места есть запас -- своя папка, пусть и скрытая.
+     */
+    function fallbackFile() {
+        var env = (typeof process !== 'undefined' && process.env) || {};
+        var home = env.USERPROFILE || env.HOME || '';
+        if (home) {
+            var desktop = home.replace(/\\/g, '/').replace(/\/$/, '') + '/Desktop';
+            try {
+                if (fs.statSync(desktop)) return desktop + '/teril-agent.js';
+            } catch (e) {}
+        }
+        return AGENT_FILE;
+    }
+
+    /**
+     * Куда лечь новому файлу. СПРАШИВАЕТСЯ ЧЕЛОВЕК, и это главное решение
+     * всего обновления: внутри Базиса скрипт своего пути не знает вовсе
+     * (`__filename` там не значит ничего), а угаданная за человека папка
+     * означает второй teril-agent.js на машине -- и запуск вчерашнего файла
+     * завтра. Диалог тот же, что у картинок (`system.askFileName`, МЕТОД
+     * system): человек показывает ровно тот файл, которым запускает скрипт,
+     * тот перезаписывается на месте, и перезапуск остаётся «открыть заново
+     * то же самое».
+     *
+     * Отдаёт `{ path, chosen }`: пустой путь -- не писать вовсе (показали
+     * не скрипт), `chosen` -- показали файл сами, значит и говорить человеку
+     * надо не «вот где лежит», а «запустите его заново».
+     */
+    function chooseTarget() {
+        var chosen = '';
+        try {
+            if (system && typeof system.askFileName === 'function') {
+                // Сказать НАДО ДО диалога, а не после: окно выбора файла ничего
+                // не объясняет само (заголовок у него чужой, базисный), и человек
+                // видит просьбу показать какой-то .js без единого слова о том,
+                // какой именно. Строка в разговоре -- единственное место, где
+                // это можно объяснить до того, как он ткнёт наугад.
+                say('Сейчас откроется выбор файла. Покажите ТОТ САМЫЙ teril-agent.js, ' +
+                    'которым вы запускаете агента, -- файл, открытый у вас в редакторе ' +
+                    'скриптов Базиса (Сервис -- Скрипты). Он и будет заменён новым, ' +
+                    'а прежний ляжет рядом с припиской .bak.\n' +
+                    'Не знаете, где он, -- нажмите в диалоге «Отмена»: тогда новый файл ' +
+                    'ляжет на рабочий стол, и путь к нему я напишу строкой.');
+                chosen = system.askFileName(AGENT_MASK) || '';
+            }
+        } catch (e) {
+            log('WARN', 'диалог файла не открылся: ' + (e && e.message ? e.message : e));
+        }
+        if (chosen) {
+            if (!/\.js$/i.test(String(chosen))) {
+                say('это не скрипт: покажите файл teril-agent.js, которым запускаете агента.', 'error');
+                return { path: '', chosen: true };
+            }
+            return { path: String(chosen), chosen: true };
+        }
+        // Диалога не досталось (node, тесты) -- там путь известен модулем.
+        try {
+            if (typeof __filename === 'string' && /teril-agent\.js$/i.test(__filename)) {
+                return { path: __filename, chosen: false };
+            }
+        } catch (e) {}
+        return { path: fallbackFile(), chosen: false };
+    }
+
+    /**
+     * Записать скачанное. Прежний файл сохраняется рядом (`.bak`) -- вернуться
+     * к тому, чем работали вчера, дороже всего именно в тот день, когда новый
+     * скрипт не пошёл.
+     */
+    function writeAgent(path, buf) {
+        try {
+            try { fs.writeFileSync(path + '.bak', fs.readFileSync(path)); } catch (e) {}
+            fs.writeFileSync(path, buf);
+            return null;
+        } catch (e) {
+            return e && e.message ? e.message : String(e);
+        }
+    }
+
+    /*
+     * ОБНОВИТЬ СЕБЯ. Дальше записи файла дело не идёт, и это не полумера:
+     * скрипт исполняется командой Базиса из файла, открытого в редакторе,
+     * и держится на `Action.Continue()` -- подменить работающий код в том же
+     * процессе нечем. Поэтому обновление говорит человеку ровно два слова:
+     * вот полный путь, откройте и запустите.
+     */
+    function updateAgent(done) {
+        function finish() { if (done) done(); }
+        fetchFile(AGENT_PATH, RESULT_TIMEOUT_MS, function (err, status, buf) {
+            if (err) {
+                say('новый скрипт не скачался: ' + netReason(err), 'error');
+                return finish();
+            }
+            if (status !== 200 || !buf || !buf.length) {
+                say('сервер не отдал скрипт (ответ ' + status + '): скачайте teril-agent.js в кабинете.', 'error');
+                return finish();
+            }
+            // Версию читаем ИЗ СКАЧАННОГО, а не верим серверу на слово: файл
+            // мог приехать от прокси-заглушки, и класть её на место рабочего
+            // скрипта -- потерять и старый.
+            var m = /var PROTOCOL_VERSION = (\d+);/.exec(buf.toString('binary'));
+            if (!m) {
+                say('скачался не скрипт: версии протокола в файле нет. Возьмите teril-agent.js в кабинете.', 'error');
+                return finish();
+            }
+            var want = chooseTarget();
+            if (!want.path) return finish();
+            var target = want.path;
+            var problem = writeAgent(target, buf);
+            // Файл держит редактор Базиса, или права не те, или показали файл
+            // на сетевом диске, которого уже нет. Кладём туда, куда точно
+            // можно, и говорим человеку новый путь -- отказ без файла хуже
+            // файла не в той папке.
+            var fallback = fallbackFile();
+            if (problem && target !== fallback) {
+                log('WARN', target + ' не записался: ' + problem);
+                say('в ' + target + ' записать не вышло (' + problem + ') -- кладу рядом.', 'error');
+                target = fallback;
+                want.chosen = false;
+                problem = writeAgent(target, buf);
+            }
+            if (problem) {
+                say('файл не записался (' + target + '): ' + problem + '\nСкачайте teril-agent.js в кабинете руками.', 'error');
+                return finish();
+            }
+            log('INFO', 'скачан агент ' + m[1] + ' в ' + target);
+            // Показали файл сами -- значит знают, где он, и открывать его
+            // заново им не по нашему пути, а по своей привычке. Не показали --
+            // путь и есть всё, что у них будет.
+            say('Скачан агент версии ' + m[1] + '. Прежний остался рядом, с припиской .bak.\n' +
+                (want.chosen
+                    ? target + ' заменён. Закройте эту форму и запустите тот же файл в Базисе заново.'
+                    : 'Файл лежит здесь:\n' + target + '\n' +
+                      'Закройте эту форму, откройте этот файл в редакторе скриптов Базиса и запустите.'));
+            finish();
+        });
+    }
+
+    /**
+     * Версии разошлись. Просьбы с этой минуты не принимаются вовсе, и это
+     * дешевле, чем принимать: ход прочитал бы модель, сходил бы к модели
+     * за патчем и отбился бы на сборке -- три минуты и ход квоты за отказ,
+     * известный заранее.
+     */
+    function onStale(serverVersion) {
+        log('WARN', 'сервер говорит на протоколе ' + serverVersion + ', скрипт -- на ' + PROTOCOL_VERSION);
+        say('Скрипт устарел: сервер говорит на протоколе ' + serverVersion + ', а этот -- на ' +
+            PROTOCOL_VERSION + '. Сборка на нём всё равно кончилась бы отказом, поэтому просьбы ' +
+            'не принимаются. Щёлкните «Обновить агента»: новый файл скрипт скачает сам, ' +
+            'а потом спросит диалогом, какой файл заменить -- покажите тот teril-agent.js, ' +
+            'которым вы его запускаете.', 'error');
+        if (chat) chat.stale(serverVersion);
+    }
+
+    /** Оборвать всё живое: запросы и отложенный опрос. */
+    function shutdown() {
+        if (closing) return;
+        closing = true;
+        stopped = true;
+        if (loopTimer !== null) { try { clearTimeout(loopTimer); } catch (e) {} loopTimer = null; }
+        for (var i = live.length - 1; i >= 0; i--) {
+            try { live[i].destroy(); } catch (e) {}
+        }
+        live.length = 0;
+    }
+
+    // Подсказку ставим ТОЛЬКО когда она поменялась: цикл опроса проходит раз
+    // в секунду, а каждая запись Action.Hint перерисовывает строку состояния
+    // Базиса. Тот же текст второй раз -- перерисовка ни за чем.
+    var lastHint = null;
+    function hint(text) {
+        if (text === lastHint) return;
+        lastHint = text;
+        try { Action.Hint = text; } catch (e) {}
+    }
+
+    // Что делает ход прямо сейчас: «Читаю модель», «Спрашиваю», «токенов
+    // столько-то». Своего поля в форме у этого больше нет -- строка живёт
+    // ЗДЕСЬ, в строке состояния Базиса, и её же цикл опроса ставит обратно
+    // после каждой задачи. Пока хода не было, показываем, что агент жив.
+    var stateText = '';
+    function idleHint() {
+        hint(stateText || ('Тэрил v' + PROTOCOL_VERSION + ': ждёт просьбу или задачу — Esc закончит сессию'));
+    }
+    function setState(line) {
+        stateText = String(line === undefined ? '' : line);
+        hint(stateText);
+    }
+
+    /*
+     * Форма чата -- она и есть ассистент. Без неё скрипт остаётся чистым
+     * агентом: цикл задач от формы не зависит вовсе и разбирает задачи сервера
+     * так же, как разбирал бы их без неё.
+     */
+    var chat = null;
+
+    function say(line, kind) {
+        if (chat) chat.append(line, kind);
+        else log('INFO', line);
+    }
+
+    function sendTurn(text, images, allowForce) {
+        request('POST', '/api/turn', { text: text, images: images, allowForce: allowForce },
+            RESULT_TIMEOUT_MS, function (err, status, data) {
+                if (err) { say('просьба не ушла: ' + netReason(err), 'error'); idle(); }
+                // 409 -- ход ИДЁТ, просто не наш: замок остаётся запертым,
+                // и снимет его `done` того хода. Сними мы его здесь, человек
+                // получил бы приглашение написать ещё одну просьбу и ещё один
+                // отказ на неё.
+                else if (status === 409) say('ход уже идёт -- дождитесь ответа', 'error');
+                else if (status !== 202) { say('сервер отказал (' + status + '): ' + ((data && data.error) || ''), 'error'); idle(); }
+            });
+    }
+
+    /*
+     * Остановить идущий ход. Останавливается при этом РАЗГОВОР С МОДЕЛЬЮ
+     * и всё, что до сборки: чтение модели и сама сборка идут в Базисе одной
+     * транзакцией, и оборвать их нечем -- сервер об этом и скажет.
+     */
+    /*
+     * Ответить «продолжать» на вопрос хода. Ход при этом уже ждёт: пока ответа
+     * нет, сервер молчит, и молчание дольше полутора минут он сам считает
+     * отказом -- то есть заканчивает ход, как заканчивал до всякого вопроса.
+     */
+    function moreTurn() {
+        request('POST', '/api/turn/continue', {}, RESULT_TIMEOUT_MS, function (err, status, data) {
+            if (err) say('продолжить не вышло: ' + netReason(err), 'error');
+            else if (status !== 200) say('продолжить не вышло (' + status + ')', 'error');
+            // Гонка, а не беда: пока щелчок ехал сюда, вопрос снялся сам --
+            // истекло молчание или ход остановлен. Замок не трогаем: ход
+            // доживает свой шаг, и снимет его `done`, как и всегда.
+            else if (data && data.answered === false) say('отвечать уже нечего: ход решил сам');
+        });
+    }
+
+    function stopTurn() {
+        request('POST', '/api/turn/stop', {}, RESULT_TIMEOUT_MS, function (err, status, data) {
+            if (err) say('остановить не вышло: ' + netReason(err), 'error');
+            else if (status !== 200) say('остановить не вышло (' + status + ')', 'error');
+            else if (data && data.stopped === false) {
+                // Гонка, а не беда: ход кончился сам, пока человек тянулся
+                // к кнопке. Замок при этом снимаем -- `done` мог приехать
+                // ещё до щелчка.
+                say('останавливать нечего: ход уже кончился');
+                idle();
+            }
+        });
+    }
+
+    /*
+     * НАСТРОЙКИ МЕСТА: спросить сервер, показать окно, отправить выбранное.
+     *
+     * Порядок именно такой, и он вынужденный. Окно модальное (см. placeForm),
+     * а под модальным окном не исполняется ни один колбэк -- значит и спросить,
+     * и отправить можно только ВНЕ его: сначала приезжает профиль, потом
+     * человек выбирает, потом закрытая форма отдаёт выбранное сюда.
+     *
+     * Профиль спрашивается КАЖДЫЙ РАЗ, а не помнится: место одно, а Базисов
+     * у него может быть несколько, и показать вчерашний профиль значило бы
+     * молча стереть сегодняшний -- разделы уезжают целиком.
+     */
+    function openPlace() {
+        setState('Читаю настройки места...');
+        request('GET', '/api/place', undefined, RESULT_TIMEOUT_MS, function (err, status, data) {
+            setState('');
+            if (err) { say('настройки места не приехали: ' + netReason(err), 'error'); return; }
+            if (status === 404) {
+                say('сервер не умеет настраивать место запросом: он старше этого скрипта.', 'error');
+                return;
+            }
+            if (status !== 200 || !data) {
+                say('настройки места не приехали (ответ ' + status + ')', 'error');
+                return;
+            }
+            var edit = null;
+            try {
+                say('Пока окно настроек открыто, агент не отвечает серверу: ход в это время не идёт.');
+                edit = placeForm(data, say);
+            } catch (e) {
+                say('окно настроек не поднялось: ' + (e && e.message ? e.message : e), 'error');
+                return;
+            }
+            if (!edit) { say('Настройки места не тронуты.'); return; }
+            savePlace(edit);
+        });
+    }
+
+    /**
+     * Отправить профиль. Оба раздела уезжают ЦЕЛИКОМ -- так их и заменяет
+     * сервер: строка, которой в окне не осталось, означает «этим мы больше
+     * не крепим», а не «оставь как было».
+     */
+    function savePlace(edit) {
+        setState('Сохраняю настройки места...');
+        request('POST', '/api/place', edit, RESULT_TIMEOUT_MS, function (err, status, data) {
+            setState('');
+            if (err) { say('настройки не сохранились: ' + netReason(err), 'error'); return; }
+            if (status !== 200) {
+                say('настройки не сохранились (' + status + '): ' + ((data && data.error) || ''), 'error');
+                return;
+            }
+            var said = data && data.said && data.said.length ? data.said.join('\n') : 'ничего не изменилось';
+            say('Настройки места сохранены:\n' + said);
+        });
+    }
+
+    /** Снять замок, когда хода не случилось вовсе: события `done` не будет. */
+    function idle() {
+        if (chat) chat.ready();
+    }
+
+    /*
+     * Начало сессии -- ЕДИНСТВЕННОЕ МЕСТО, где версии сверяются ДО хода:
+     * скрипт называет свою, сервер отвечает своей. Раньше расхождение
+     * вылезало последним шагом хода (сборка отбивала задачу по `job.v`),
+     * то есть после чтения модели и разговора с моделью -- за минуты и за ход
+     * квоты. Здесь оно стоит одного поля в запросе, который и так уходит.
+     */
+    function startSession() {
+        request('POST', '/api/session', { v: PROTOCOL_VERSION }, RESULT_TIMEOUT_MS, function (err, status, data) {
+            if (err || status !== 200) {
+                say('сессию начать не вышло: ' + (err ? netReason(err) : 'ответ ' + status), 'error');
+                return;
+            }
+            log('INFO', 'сессия ' + data.sessionId);
+            var server = data && Number(data.protocol);
+            // Сервер старее нас или молчит о версии -- сессия обычная: старый
+            // сервер поля не шлёт вовсе, а спорить с ним нам не о чем.
+            if (server && server !== PROTOCOL_VERSION) {
+                onStale(server);
+                return;
+            }
+            say('Сессия началась. Просите словами; Esc заканчивает разговор.');
+        });
+    }
+
+    function endSession() {
+        // Esc сюда не дойдёт -- скрипт умирает молча, и сервер узнаёт о конце
+        // по молчанию опроса. Это прощание только для закрытия формы крестиком.
+        // За прощанием скрипт ЗАКАНЧИВАЕТСЯ: без формы ассистента нет.
+        stopped = true;
+        var done = false;
+        function finish() {
+            if (done) return;
+            done = true;
+            log('INFO', 'форма закрыта -- заканчиваю скрипт');
+            // Сначала гасим сокеты и таймеры, и только потом заканчиваем
+            // команду -- ОТДЕЛЬНЫМ таймером, а не отсюда: сюда мы попадаем
+            // из колбэка сокета, и `Action.Finish` в нём валит цикл node
+            // на ещё не закрытом хэндле.
+            shutdown();
+            setTimeout(function () {
+                try { Action.Finish(); } catch (e) {}
+            }, 100);
+        }
+        // Ждём ответа сервера, но недолго: молчащий сервер не повод оставлять
+        // команду Базиса висеть -- о конце сессии он узнает по молчанию опроса.
+        var late = setTimeout(finish, 2000);
+        request('POST', '/api/session/end', {}, RESULT_TIMEOUT_MS, function () {
+            try { clearTimeout(late); } catch (e) {}
+            finish();
+        });
+    }
+
+    /*
+     * Выход из учётной записи. Это НЕ конец скрипта: форма чата и разговор
+     * в ней остаются, а поверх поднимается форма входа -- ровно тем же путём,
+     * каким сюда приходят из 401 (`onUnauthorized`). Разница одна: там токен
+     * перестал работать сам, здесь его стирают нарочно.
+     *
+     * `shutdown()` для этого не годится вовсе: он гасит запросы НАВСЕГДА
+     * (`closing`), то есть после выхода не ушёл бы ни один запрос с новым
+     * токеном. Гасится ровно то же, что гасит 401: цикл опроса.
+     */
+    function logout() {
+        // Прощаемся, пока токен ещё наш: сервер закроет сессию сразу, а не
+        // через десять минут молчания опроса. Ответа не ждём -- уходим в любом.
+        request('POST', '/api/session/end', {}, RESULT_TIMEOUT_MS, function () {});
+        began = false;
+        stopped = true;
+        if (loopTimer !== null) { try { clearTimeout(loopTimer); } catch (e) {} loopTimer = null; }
+        setEndpoint(RELAY_URL, '');
+        try {
+            forgetToken(fs);
+            log('INFO', 'выход из учётной записи: токен стёрт из ' + CONFIG_FILE);
+        } catch (e) {
+            log('ERROR', CONFIG_FILE + ' не записался: ' + (e && e.message ? e.message : e));
+        }
+        say('Вы вышли. Токен стёрт с этой машины -- введите токен из кабинета, чтобы работать дальше.');
+        // Замок снимаем: хода больше не будет, а `done` уже некому приехать.
+        idle();
+        askToken('выход из учётной записи');
+    }
+
+    function openChat() {
+        if (!cfg.ui || chat) return;
+        try {
+            chat = chatForm({ send: sendTurn, stop: stopTurn, more: moreTurn, close: endSession, logout: logout, login: useToken, update: updateAgent, place: openPlace, status: setState, trace: trace, log: log });
+            // В лог -- ЦЕЛИКОМ: форма длинный отчёт показывает началом, и без
+            // файла остаток было бы не прочитать вовсе.
+            host.ui = function (text, kind) {
+                log(kind === 'error' ? 'ERROR' : 'INFO', 'ui: ' + text);
+                trace('append ' + (kind || 'log'));
+                chat.append(text, kind);
+                trace('append готов');
+            };
+        } catch (e) {
+            log('ERROR', 'форму поднять не вышло, остаюсь агентом: ' + (e && e.message ? e.message : e));
+        }
+    }
+
+    // Сколько пустых опросов подряд вернулись быстрее пола. Считаются, чтобы
+    // назвать причину: молча выдержанная пауза выглядела бы как «агент спит».
+    var fastEmpty = 0;
+
+    // Пульс холостого хода. Скрипт живёт в UI-потоке Базиса: умер поток --
+    // умолкает и цикл опроса. Поэтому строка «жив» отвечает на первый вопрос
+    // всякого зависания: встало всё или только окно. Без неё тишина в журнале
+    // не значит ничего -- задач может не быть и десять минут подряд.
+    var polls = 0;
+    var aliveAt = Date.now();
+    function alive() {
+        var now = Date.now();
+        if (now - aliveAt < ALIVE_MS) return;
+        aliveAt = now;
+        log('INFO', 'жив: опросов ' + polls);
+    }
+
+    // Форму закрыли -- опрашивать больше некого и незачем.
+    var stopped = false;
+    /** Отложенный следующий опрос: при закрытии его надо снять. */
+    var loopTimer = null;
+
+    function loop() {
+        loopTimer = null;
+        if (stopped) return;
+        idleHint();
+        var started = Date.now();
+        // Следующий опрос не раньше пола: задержка меряется от начала этого.
+        function again(delay) {
+            var left = MIN_POLL_INTERVAL_MS - (Date.now() - started);
+            loopTimer = setTimeout(loop, Math.max(delay, left > 0 ? left : 0));
+        }
+        request('GET', '/poll', undefined, POLL_TIMEOUT_MS, function (err, status, job) {
+            polls++;
+            alive();
+            if (err || status === 204 || !job) {
+                if (err) { log('ERROR', 'poll: ' + netReason(err).replace(/\n/g, ' ')); fastEmpty = 0; }
+                /*
+                 * СОВЕТ ПРО ПРОКСИ -- ТОЛЬКО НА ПУСТОЙ ОТВЕТ, а не на всякий
+                 * быстрый. Ответ с КОДОМ (403, 404, 500) пришёл от того, кто
+                 * понял запрос, и звать человека проверять RELAY_URL значит
+                 * увести его от настоящей причины: код он увидит и назовёт нам,
+                 * а прокси пойдёт искать в системе, где его нет.
+                 */
+                else if (status !== 204 && status !== 200) { log('ERROR', 'poll status=' + status); fastEmpty = 0; }
+                else if (Date.now() - started < MIN_POLL_INTERVAL_MS) {
+                    fastEmpty++;
+                    if (fastEmpty === 1 || fastEmpty % 60 === 0) {
+                        log('WARN', '/poll отвечает пусто за ' + (Date.now() - started) + ' мс, ' + fastEmpty +
+                            ' раз подряд (status=' + status + '): релей держит опрос ~25 с, значит отвечает не он — ' +
+                            'проверьте, что RELAY_URL смотрит в релей, а не в прокси или заглушку туннеля');
+                    }
+                } else fastEmpty = 0;
+                again(err ? RETRY_DELAY_MS : 0);
+                return;
+            }
+            fastEmpty = 0;
+            if (status !== 200) {
+                log('ERROR', 'poll status=' + status);
+                again(RETRY_DELAY_MS);
+                return;
+            }
+
+            log('INFO', 'задача ' + job.jobId + ' method=' + job.method + ' cmds=' + ((job.cmds || []).length));
+            // Подсказка БЕЗ номера задачи: она пишется в строку состояния Базиса,
+            // то есть в окно, а с номером менялась на каждой задаче и писалась
+            // каждый раз. Так за очередь коротких задач окно не трогается вовсе.
+            trace('hint');
+            hint('Тэрил: выполняет ' + job.method);
+            trace('handle');
+
+            var result;
+            var tJob = Date.now();
+            try {
+                result = handle(job, host);
+            } catch (e) {
+                // Сюда попадают только падения вне транзакции: applyJob сам откатывает.
+                result = { v: PROTOCOL_VERSION, jobId: job.jobId, ok: false, duplicate: false, error: e.message };
+            }
+            // Время задачи -- в каждой строке: пока задача идёт, Базис не отвечает
+            // вовсе, и «сколько он молчал» здесь единственная измеримая величина.
+            log(result.ok ? 'INFO' : 'ERROR', 'задача ' + job.jobId + ' ok=' + result.ok +
+                ' за ' + ((Date.now() - tJob) / 1000).toFixed(1) + ' с' + (result.error ? ' ' + result.error : ''));
+
+            request('POST', '/result', result, RESULT_TIMEOUT_MS, function (e2, st) {
+                if (e2) log('ERROR', 'result: ' + e2.message);
+                else if (st !== 200) log('ERROR', 'result status=' + st);
+                loopTimer = setTimeout(loop, 0); // задача была: за следующей идём сразу
+            });
+        });
+    }
+
+    // Без этой строки транспорта нет вообще. По завершении основного тела скрипта
+    // Базис ЗАВЕРШАЕТ команду, и ни один асинхронный колбэк — ни http, ни setTimeout —
+    // больше не вызовется: `Continue()` велит движку продолжать вызывать прерывания.
+    // Симптом пропуска ровно такой: в логе одна стартовая строка и вечная тишина,
+    // а релей не видит ни одного /poll (даже ошибки не будет — таймер тоже мёртв).
+    Action.Continue();
+
+    log('INFO', 'teril-agent v' + PROTOCOL_VERSION + ' ? ' + RELAY_URL + ' (настройки: ' + cfg.source + ')');
+
+    /**
+     * Токен введён: работаем с ним. Сохраняем СРАЗУ, до первого запроса:
+     * проверять токен отдельным походом на сервер незачем -- первый же `/poll`
+     * ответит 401, и мы вернёмся ко входу тем же путём, что и при отозванном
+     * месте.
+     */
+    function useToken(t) {
+        setEndpoint(RELAY_URL, t);
+        try {
+            // Адрес пишется вместе с токеном, хотя его и не спрашивали:
+            // прийти он мог из окружения, а окружение Базис пробрасывает
+            // не всегда -- следующий запуск иначе ушёл бы в localhost.
+            saveConfig(fs, { url: RELAY_URL, token: t });
+            log('INFO', 'токен принят, настройки сохранены в ' + CONFIG_FILE);
+        } catch (e) {
+            log('ERROR', CONFIG_FILE + ' не записался: ' + (e && e.message ? e.message : e));
+        }
+        begin();
+    }
+
+    /**
+     * Спросить токен. Спрашивает его ФОРМА ЧАТА -- полем на месте просьбы,
+     * а не своим окном: отдельная форма входа поднималась без владельца
+     * и уходила за окно чата, где ввести в неё было нечего.
+     *
+     * Поэтому форма здесь ОТКРЫВАЕТСЯ, если её ещё нет: до первого токена
+     * `begin()` не звался ни разу, и показать вопрос было бы негде.
+     */
+    function askToken(why) {
+        /*
+         * ЖУРНАЛ ОБЯЗАН СКАЗАТЬ, ЧТО МЫ ЖДЁМ ТОКЕН, и сказать это здесь.
+         *
+         * Слова формы попадают в лог только через `host.ui`, а вопрос о токене
+         * form печатает себе сама -- значит ожидание входа не оставляло в файле
+         * НИ ОДНОЙ строки. Наружу это выглядело как смерть скрипта: старт,
+         * `render N строк` и вечная тишина -- ровно тот же хвост, что у потери
+         * `Action.Continue()`, и разобрать их было нечем. Разбор 2026-09-10
+         * (место 192) на этом и стоял: человек шесть минут смотрел на форму,
+         * прислал журнал, а в журнале нечего читать -- при том что релей и вправду
+         * не видел от него ни одного запроса, потому что запросов и не было:
+         * агент ждал токен.
+         */
+        log('INFO', 'жду токен места (' + why + '): введите его в форме, выдаётся в кабинете');
+        if (!cfg.ui) {
+            log('WARN', why + ': положите {"url":…,"token":…} в ' + CONFIG_FILE);
+            return false;
+        }
+        openChat();
+        if (!chat) return false;
+        chat.askToken(RELAY_URL);
+        return true;
+    }
+
+    /** Запуск после того, как токен есть: форма чата, сессия и цикл опроса. */
+    var began = false;
+    function begin() {
+        if (began) return;
+        began = true;
+        stopped = false;
+        openChat();
+        if (chat) startSession();
+        loop();
+    }
+
+    /*
+     * Место отозвали или токен перевыдали, пока скрипт работал. Цикл опроса
+     * при этом ГАСИТСЯ: сотня 401 в минуту не приблизит нас к разгадке,
+     * а человеку надо сказать одно -- введите токен заново.
+     */
+    onUnauthorized = function () {
+        if (!began) return;
+        began = false;
+        stopped = true;
+        if (loopTimer !== null) { try { clearTimeout(loopTimer); } catch (e) {} loopTimer = null; }
+        /*
+         * ЗАМОК СНИМАЕТСЯ ЗДЕСЬ, и это не мелочь. Отказ приходит и на просьбу:
+         * форма к этому времени заперта ходом и ждёт события `done`, а `done`
+         * не приедет никогда -- хода не начиналось. Без этой строки человек
+         * получал ответ через ПЯТНАДЦАТЬ МИНУТ и не тот: «сервер молчит»
+         * вместо «токен не признан».
+         */
+        idle();
+        say('Сервер не признал токен: место отозвано, токен перевыдан -- или вставлен не токен, ' +
+            'а его хвост из таблицы кабинета. Токен длинный и начинается с bz_; ' +
+            'показывается он один раз при выдаче.', 'error');
+        log('WARN', 'сервер ответил 401: токен не признан');
+        askToken('токен не признан');
+    };
+
+    if (noToken(RELAY_TOKEN)) askToken('токен не задан');
+    else begin();
+}
+
+/* ?? Запуск / экспорт ??????????????????????????????????????????????????????? */
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        PROTOCOL_VERSION: PROTOCOL_VERSION,
+        agentConfig: agentConfig,
+        forgetToken: forgetToken,
+        tokenComplaint: tokenComplaint,
+        netReason: netReason,
+        applyJob: applyJob,
+        handle: handle,
+        pickEdge: pickEdge,
+        bazisHost: bazisHost,
+        startAgent: startAgent
+    };
+}
+
+// Внутри Базиса файл запускается как скрипт: глобаль Action есть только там.
+if (typeof Action !== 'undefined' && typeof AddVertPanel !== 'undefined') {
+    startAgent();
+}
